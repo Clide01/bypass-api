@@ -133,11 +133,11 @@ async function bypassPlatoRelay(url) {
             defaultViewport: { width: 1366, height: 768 },
             executablePath: await chromium.executablePath(),
             headless: true,
-            timeout: 60000,
+            timeout: 45000,
             ignoreDefaultArgs: ['--enable-automation']
         });
 
-        // Automatically close popup ads
+        // Close popup ads immediately
         browser.on('targetcreated', async (target) => {
             try {
                 if (target.type() === 'page') {
@@ -155,6 +155,26 @@ async function bypassPlatoRelay(url) {
         page = await browser.newPage();
         await page.setUserAgent('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36');
         
+        // =========================================================================
+        // UPGRADE 1: BACKGROUND API INTERCEPTOR (Catches XHR/Fetch JSON keys!)
+        // =========================================================================
+        page.on('response', async (response) => {
+            try {
+                const resUrl = response.url();
+                const contentType = response.headers()['content-type'] || '';
+                if (contentType.includes('application/json') || resUrl.includes('api') || resUrl.includes('key') || resUrl.includes('auth')) {
+                    const json = await response.json().catch(() => null);
+                    if (json) {
+                        const potentialKey = json.key || json.token || json.result || json.data || json.bypassed;
+                        if (potentialKey && typeof potentialKey === 'string' && (isValidKey(potentialKey) || isFreeKey(potentialKey))) {
+                            console.log(`[PlatoEngine] ⚡ INTERCEPTED KEY FROM NETWORK RESPONSE: ${potentialKey}`);
+                            finalKey = potentialKey;
+                        }
+                    }
+                }
+            } catch (e) {}
+        });
+
         await page.setRequestInterception(true);
         page.on('request', (req) => {
             const type = req.resourceType();
@@ -170,19 +190,16 @@ async function bypassPlatoRelay(url) {
         });
 
         console.log(`[PlatoEngine] Navigating to URL...`);
-        
-        await page.goto(url, {
-            waitUntil: 'domcontentloaded',
-            timeout: 30000
-        });
-
+        await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 30000 });
         await new Promise(resolve => setTimeout(resolve, 3000));
 
         // =========================================================================
-        // MAIN EXTRACTION & CHECKPOINT LOOP
+        // MAIN EXTRACTION & CHECKPOINT LOOP (Capped at 12 steps ~ 35s total)
         // =========================================================================
         let stepCount = 0;
-        const maxSteps = 25;
+        const maxSteps = 12; // Prevents Discord 55-second timeouts
+        let previousUrl = '';
+        let sameUrlCount = 0;
 
         while (stepCount < maxSteps && !finalKey) {
             stepCount++;
@@ -192,7 +209,19 @@ async function bypassPlatoRelay(url) {
                 const currentUrl = await page.url().catch(() => 'about:blank');
                 console.log(`[PlatoEngine] Current URL: ${currentUrl.substring(0, 80)}...`);
 
-                // 1. CHECK URL PARAMETERS FIRST (Crucial for PlatoRelay redirects!)
+                // Break early if we are stuck on the exact same checkpoint page for 4 steps
+                if (currentUrl === previousUrl) {
+                    sameUrlCount++;
+                    if (sameUrlCount >= 4) {
+                        console.log('[PlatoEngine] Stuck on same checkpoint for 4 checks, breaking loop...');
+                        break;
+                    }
+                } else {
+                    sameUrlCount = 0;
+                    previousUrl = currentUrl;
+                }
+
+                // 1. CHECK URL PARAMETERS
                 try {
                     const urlObj = new URL(currentUrl);
                     const keyParam = urlObj.searchParams.get('key') || urlObj.searchParams.get('token') || urlObj.searchParams.get('k');
@@ -230,7 +259,7 @@ async function bypassPlatoRelay(url) {
                 }
                 if (finalKey) break;
 
-                // 3. CHECK DOM ELEMENTS
+                // 3. CHECK DOM ELEMENTS & INPUT VALUES
                 const selectors = [
                     'pre', 'code', 'textarea', '.key', '#key', '.result', '#result',
                     '.free-key', '#free-key', '.bypass-key', '#bypass-key',
@@ -252,7 +281,24 @@ async function bypassPlatoRelay(url) {
                 }
                 if (finalKey) break;
 
-                // 4. CHECK AND CLICK CLOUDFLARE TURNSTILE IF PRESENT
+                // 4. CHECK LOCALSTORAGE & SESSIONSTORAGE IN BROWSER MEMORY
+                const memoryKey = await page.evaluate(() => {
+                    for (let i = 0; i < localStorage.length; i++) {
+                        const keyName = localStorage.key(i);
+                        const val = localStorage.getItem(keyName) || '';
+                        if (val.includes('FREE_') || val.includes('FREE-') || (val.length > 20 && !val.includes('http'))) {
+                            return val;
+                        }
+                    }
+                    return null;
+                });
+                if (memoryKey && (isFreeKey(memoryKey) || isValidKey(memoryKey))) {
+                    console.log(`[PlatoEngine] ✅ FOUND KEY in localStorage: ${memoryKey}`);
+                    finalKey = memoryKey;
+                    break;
+                }
+
+                // 5. CLICK CLOUDFLARE TURNSTILE IF PRESENT
                 try {
                     const frames = page.frames();
                     for (const frame of frames) {
@@ -263,7 +309,7 @@ async function bypassPlatoRelay(url) {
                     }
                 } catch (e) {}
 
-                // 5. CLICK BUTTONS TO ADVANCE CHECKPOINT
+                // 6. CLICK BUTTONS TO ADVANCE CHECKPOINT
                 const clicked = await page.evaluate(() => {
                     const buttonTexts = [
                         'continue', 'get key', 'free access', 'proceed', 
@@ -293,13 +339,13 @@ async function bypassPlatoRelay(url) {
 
                 if (clicked) {
                     console.log(`[PlatoEngine] Clicked checkpoint button: "${clicked}"`);
-                    await new Promise(resolve => setTimeout(resolve, 3500));
+                    await new Promise(resolve => setTimeout(resolve, 2500));
                 } else {
-                    await new Promise(resolve => setTimeout(resolve, 3000));
+                    await new Promise(resolve => setTimeout(resolve, 2000));
                 }
 
             } catch (stepError) {
-                await new Promise(resolve => setTimeout(resolve, 2000));
+                await new Promise(resolve => setTimeout(resolve, 1500));
                 continue;
             }
         }
@@ -309,7 +355,7 @@ async function bypassPlatoRelay(url) {
             return finalKey;
         }
 
-        // Fallback to best candidate
+        // Return best valid fallback key
         const freeKeys = allExtractedKeys.filter(key => isFreeKey(key) && isValidKey(key));
         if (freeKeys.length > 0) {
             await browser.close().catch(() => {});

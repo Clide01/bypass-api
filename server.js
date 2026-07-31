@@ -28,7 +28,7 @@ const app = express();
 
 // Security middleware
 app.use(helmet({
-    contentSecurityPolicy: false, // Disabled for bypass functionality
+    contentSecurityPolicy: false,
     crossOriginEmbedderPolicy: false
 }));
 app.use(cors({
@@ -39,8 +39,8 @@ app.use(express.json({ limit: '10mb' }));
 
 // Rate limiting
 const limiter = rateLimit({
-    windowMs: 60 * 1000, // 1 minute
-    max: 30, // 30 requests per minute
+    windowMs: 60 * 1000,
+    max: 30,
     message: { error: 'Too many requests, please try again later.' },
     standardHeaders: true,
     legacyHeaders: false,
@@ -57,8 +57,320 @@ app.use('/api', (req, res, next) => {
 });
 
 // ================================================================
-// ENHANCED BYPASS HANDLERS
+// ENHANCED PLATORELAY HANDLER WITH FIXED BROWSER MANAGEMENT
 // ================================================================
+
+async function bypassPlatoRelay(url) {
+    let browser = null;
+    let page = null;
+    
+    try {
+        console.log(`[PlatoRelay] Launching browser for: ${url.substring(0, 100)}...`);
+
+        const chromiumArgs = await chromium.args;
+        const baseArgs = Array.isArray(chromiumArgs) ? chromiumArgs : [];
+
+        browser = await puppeteer.launch({
+            args: [
+                ...baseArgs,
+                '--no-sandbox',
+                '--disable-setuid-sandbox',
+                '--disable-dev-shm-usage',
+                '--disable-gpu',
+                '--no-zygote',
+                '--js-flags=--max-old-space-size=256',
+                '--disable-blink-features=AutomationControlled',
+                '--disable-features=IsolateOrigins,site-per-process',
+                '--disable-web-security',
+                '--disable-features=BlockInsecurePrivateNetworkRequests',
+                '--window-size=1366,768',
+                '--disable-background-timer-throttling',
+                '--disable-backgrounding-occluded-windows',
+                '--disable-renderer-backgrounding'
+            ],
+            defaultViewport: { width: 1366, height: 768 },
+            executablePath: await chromium.executablePath(),
+            headless: true,
+            timeout: 30000,
+        });
+
+        // FIX: Better popup handling - only close popups, keep main page
+        const mainPagePromise = new Promise((resolve) => {
+            browser.on('targetcreated', async (target) => {
+                try {
+                    if (target.type() === 'page') {
+                        const newPage = await target.page();
+                        if (newPage) {
+                            const pageUrl = await newPage.url();
+                            // Only close if it's a popup (about:blank or different from main URL)
+                            if (pageUrl === 'about:blank' || (pageUrl && pageUrl !== url && !pageUrl.includes('platorelay'))) {
+                                console.log(`[PlatoRelay] Closed popup: ${pageUrl}`);
+                                await newPage.close().catch(() => {});
+                            } else if (pageUrl && pageUrl.includes('platorelay')) {
+                                // This is our main page
+                                console.log(`[PlatoRelay] Main page detected: ${pageUrl}`);
+                                resolve(newPage);
+                            }
+                        }
+                    }
+                } catch (e) {
+                    // Ignore errors in popup handling
+                }
+            });
+        });
+
+        // Create initial page
+        page = await browser.newPage();
+        
+        // Set up page before navigation
+        await page.setUserAgent('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36');
+        
+        // Block unnecessary resources
+        await page.setRequestInterception(true);
+        page.on('request', (req) => {
+            const type = req.resourceType();
+            if (['image', 'media', 'font', 'stylesheet'].includes(type)) {
+                req.abort();
+            } else {
+                req.continue();
+            }
+        });
+
+        // Set extra HTTP headers
+        await page.setExtraHTTPHeaders({
+            'Accept-Language': 'en-US,en;q=0.9',
+            'Accept-Encoding': 'gzip, deflate, br',
+            'Connection': 'keep-alive',
+            'Upgrade-Insecure-Requests': '1'
+        });
+
+        console.log(`[PlatoRelay] Navigating to URL...`);
+        
+        // Navigate with proper error handling
+        try {
+            await page.goto(url, {
+                waitUntil: 'networkidle0',
+                timeout: 30000
+            });
+        } catch (navError) {
+            // If navigation fails, check if we got redirected
+            const currentUrl = page.url();
+            if (currentUrl && currentUrl !== 'about:blank' && currentUrl !== url) {
+                console.log(`[PlatoRelay] Redirected to: ${currentUrl}`);
+                // Continue with the redirected URL
+            } else {
+                throw navError;
+            }
+        }
+
+        // Check for Cloudflare
+        try {
+            const pageTitle = await page.title();
+            if (pageTitle && (pageTitle.includes('Just a moment') || pageTitle.includes('Attention Required'))) {
+                throw new Error('Cloudflare protection detected. Please try again later.');
+            }
+        } catch (titleError) {
+            // Ignore title errors, continue
+        }
+
+        // =========================================================================
+        // SMART CHECKPOINT POLLING LOOP
+        // =========================================================================
+        const maxAttempts = 15;
+        let extractedKey = null;
+
+        for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+            console.log(`[PlatoRelay] Checkpoint scan attempt ${attempt}/${maxAttempts}...`);
+            
+            try {
+                await new Promise(resolve => setTimeout(resolve, 3000));
+
+                // Check if page is still valid
+                const currentUrl = await page.url().catch(() => 'about:blank');
+                if (currentUrl === 'about:blank') {
+                    console.log('[PlatoRelay] Page closed, attempting to recover...');
+                    continue;
+                }
+
+                const urlObj = new URL(currentUrl);
+                
+                // Check URL parameters
+                const keyParam = urlObj.searchParams.get('key') || 
+                               urlObj.searchParams.get('token') || 
+                               urlObj.searchParams.get('k') ||
+                               urlObj.searchParams.get('code') ||
+                               urlObj.searchParams.get('id');
+                
+                if (keyParam && keyParam.length > 15) {
+                    console.log(`[PlatoRelay] Extracted key from URL param: ${keyParam.substring(0, 10)}...`);
+                    extractedKey = keyParam;
+                    break;
+                }
+
+                // Check page content
+                const pageContent = await page.content().catch(() => null);
+                if (!pageContent) continue;
+                
+                const $ = cheerio.load(pageContent);
+                
+                const selectors = [
+                    'pre', 'code', 'textarea', 
+                    'input[name="key"]', 'input[name="token"]',
+                    '#result', '.result', '.key', '#key', 
+                    '.bypass-key', '#bypass-key',
+                    '[data-key]', '[data-result]',
+                    '.generated-key', '#generated-key',
+                    '.script-key', '#script-key'
+                ];
+                
+                for (const selector of selectors) {
+                    try {
+                        const element = $(selector).first();
+                        let val = element.text().trim() || element.val();
+                        if (val && val.length > 15 && !val.includes('http') && !val.includes('script') && !val.includes('function')) {
+                            console.log(`[PlatoRelay] Extracted key from ${selector}`);
+                            extractedKey = val;
+                            break;
+                        }
+                    } catch (e) {
+                        continue;
+                    }
+                }
+                
+                if (extractedKey) break;
+
+                // Click any button to advance
+                try {
+                    const clicked = await page.evaluate(() => {
+                        const buttons = Array.from(document.querySelectorAll(
+                            'button, a, div[role="button"], span[role="button"], ' +
+                            '[class*="btn"], [class*="button"], [class*="continue"], ' +
+                            '[class*="verify"], [class*="proceed"], [class*="next"], ' +
+                            '[class*="get"], [class*="claim"], [class*="unlock"]'
+                        ));
+                        
+                        const targetTexts = ['continue', 'get key', 'free access', 'proceed', 'verify', 'next', 'claim', 'unlock'];
+                        
+                        for (const el of buttons) {
+                            const text = (el.innerText || el.textContent || '').toLowerCase().trim();
+                            if (text.includes('discord') || text.includes('support') || text.includes('tutorial') || text.includes('home')) continue;
+                            
+                            if (targetTexts.some(t => text.includes(t))) {
+                                el.scrollIntoView({ behavior: 'smooth', block: 'center' });
+                                el.click();
+                                return text;
+                            }
+                        }
+                        return null;
+                    });
+
+                    if (clicked) {
+                        console.log(`[PlatoRelay] Clicked: "${clicked}"`);
+                    }
+                } catch (e) {
+                    console.log(`[PlatoRelay] Click attempt failed: ${e.message}`);
+                }
+
+                // Handle Turnstile/Cloudflare challenges
+                try {
+                    const frames = page.frames();
+                    for (const frame of frames) {
+                        if (frame.url().includes('turnstile') || frame.url().includes('cloudflare')) {
+                            try {
+                                const checkbox = await frame.$('input[type="checkbox"], .chk, #challenge-stage');
+                                if (checkbox) {
+                                    await checkbox.click();
+                                    console.log('[PlatoRelay] Clicked Cloudflare checkbox');
+                                }
+                            } catch (e) {}
+                        }
+                    }
+                } catch (e) {}
+
+            } catch (loopError) {
+                console.log(`[PlatoRelay] Loop iteration ${attempt} error: ${loopError.message}`);
+                continue;
+            }
+        }
+
+        // =========================================================================
+        // FINAL EXTRACTION ATTEMPTS
+        // =========================================================================
+        if (!extractedKey) {
+            try {
+                const finalContent = await page.content().catch(() => null);
+                if (finalContent) {
+                    const $ = cheerio.load(finalContent);
+                    
+                    // Check JavaScript variables
+                    const scripts = $('script').toArray();
+                    for (const script of scripts) {
+                        try {
+                            const content = $(script).html() || '';
+                            const keyMatches = content.match(/['"]([A-Za-z0-9_\-]{25,})['"]/g);
+                            if (keyMatches) {
+                                for (const match of keyMatches) {
+                                    const clean = match.replace(/['"]/g, '');
+                                    if (!clean.includes('http') && !clean.includes('script') && !clean.includes('function') && clean.length > 20) {
+                                        extractedKey = clean;
+                                        break;
+                                    }
+                                }
+                            }
+                            if (extractedKey) break;
+                        } catch (e) {
+                            continue;
+                        }
+                    }
+                }
+            } catch (e) {
+                console.log(`[PlatoRelay] Final extraction error: ${e.message}`);
+            }
+        }
+
+        if (!extractedKey) {
+            try {
+                const bodyText = await page.evaluate(() => document.body.innerText).catch(() => null);
+                if (bodyText) {
+                    const keyRegex = /[A-Za-z0-9_\-]{25,}/g;
+                    const matches = bodyText.match(keyRegex);
+                    
+                    if (matches) {
+                        const excludedWords = ['script', 'function', 'window', 'document', 'javascript', 
+                                             'browser', 'chrome', 'firefox', 'chromium', 'cloudflare', 
+                                             'platorelay', 'completed', 'continue', 'undefined', 'null',
+                                             'localhost', 'https', 'http', 'www'];
+                        
+                        for (const key of matches) {
+                            if (!excludedWords.some(word => key.toLowerCase().includes(word)) && 
+                                !key.startsWith('http') && key.length > 20) {
+                                extractedKey = key;
+                                break;
+                            }
+                        }
+                    }
+                }
+            } catch (e) {
+                console.log(`[PlatoRelay] Body text extraction error: ${e.message}`);
+            }
+        }
+
+        await browser.close();
+        browser = null;
+        
+        return extractedKey || 'Key not found on page';
+        
+    } catch (err) {
+        console.error(`[PlatoRelay] Error: ${err.message}`);
+        if (browser) {
+            try {
+                await browser.close();
+            } catch (e) {}
+            browser = null;
+        }
+        throw new Error(`PlatoRelay bypass failed: ${err.message}`);
+    }
+}
 
 /**
  * Platoboost handler with improved extraction
@@ -78,7 +390,6 @@ async function bypassPlatoboost(url) {
 
         const $ = cheerio.load(resp.data);
         
-        // Try multiple extraction methods
         const extractors = [
             () => $('pre, code, textarea').first().text().trim(),
             () => {
@@ -111,7 +422,6 @@ async function bypassPlatoboost(url) {
             }
         }
 
-        // If we found a redirect URL, follow it
         const redirectMatch = resp.data.match(/window\.location\s*=\s*['"]([^'"]+)['"]/);
         if (redirectMatch) {
             const nextUrl = new URL(redirectMatch[1], url).href;
@@ -128,238 +438,6 @@ async function bypassPlatoboost(url) {
         return 'Unable to extract key';
     } catch (err) {
         throw new Error(`Platoboost bypass failed: ${err.message}`);
-    }
-}
-
-/**
- * Enhanced PlatoRelay handler with better browser management and extraction
- */
-async function bypassPlatoRelay(url) {
-    let browser = null;
-    let page = null;
-    
-    try {
-        console.log(`[PlatoRelay] Launching browser for: ${url}`);
-
-        const chromiumArgs = await chromium.args;
-        const baseArgs = Array.isArray(chromiumArgs) ? chromiumArgs : [];
-
-        browser = await puppeteer.launch({
-            args: [
-                ...baseArgs,
-                '--no-sandbox',
-                '--disable-setuid-sandbox',
-                '--disable-dev-shm-usage',
-                '--disable-gpu',
-                '--single-process',
-                '--no-zygote',
-                '--js-flags=--max-old-space-size=256',
-                '--disable-blink-features=AutomationControlled',
-                '--disable-features=IsolateOrigins,site-per-process',
-                '--disable-web-security',
-                '--disable-features=BlockInsecurePrivateNetworkRequests',
-                '--disable-features=OutOfBlinkCors',
-                '--window-size=1366,768'
-            ],
-            defaultViewport: { width: 1366, height: 768 },
-            executablePath: await chromium.executablePath(),
-            headless: true,
-            timeout: 30000,
-        });
-
-        // Automatically close popup windows
-        browser.on('targetcreated', async (target) => {
-            if (target.type() === 'page') {
-                const newPage = await target.page();
-                if (newPage && newPage.url() !== url) {
-                    console.log(`[PlatoRelay] Closed popup: ${newPage.url()}`);
-                    await newPage.close().catch(() => {});
-                }
-            }
-        });
-
-        page = await browser.newPage();
-
-        // Set user agent and headers
-        await page.setUserAgent('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36');
-        
-        // Block unnecessary resources
-        await page.setRequestInterception(true);
-        page.on('request', (req) => {
-            const type = req.resourceType();
-            if (['image', 'media', 'font', 'stylesheet'].includes(type)) {
-                req.abort();
-            } else {
-                req.continue();
-            }
-        });
-
-        // Set extra HTTP headers
-        await page.setExtraHTTPHeaders({
-            'Accept-Language': 'en-US,en;q=0.9',
-            'Accept-Encoding': 'gzip, deflate, br',
-            'Connection': 'keep-alive',
-            'Upgrade-Insecure-Requests': '1'
-        });
-
-        console.log(`[PlatoRelay] Navigating to URL...`);
-        await page.goto(url, {
-            waitUntil: 'networkidle0',
-            timeout: 30000
-        });
-
-        // Check for Cloudflare
-        const pageTitle = await page.title();
-        if (pageTitle.includes('Just a moment') || pageTitle.includes('Attention Required')) {
-            throw new Error('Cloudflare protection detected. Please try again later.');
-        }
-
-        // =========================================================================
-        // SMART CHECKPOINT POLLING LOOP
-        // =========================================================================
-        const maxAttempts = 12;
-        let extractedKey = null;
-
-        for (let attempt = 1; attempt <= maxAttempts; attempt++) {
-            console.log(`[PlatoRelay] Checkpoint scan attempt ${attempt}/${maxAttempts}...`);
-            await new Promise(resolve => setTimeout(resolve, 3000));
-
-            const currentUrl = page.url();
-            const urlObj = new URL(currentUrl);
-            
-            // Check URL parameters
-            const keyParam = urlObj.searchParams.get('key') || 
-                           urlObj.searchParams.get('token') || 
-                           urlObj.searchParams.get('k') ||
-                           urlObj.searchParams.get('code') ||
-                           urlObj.searchParams.get('id');
-            
-            if (keyParam && keyParam.length > 15) {
-                console.log(`[PlatoRelay] Extracted key from URL param: ${keyParam.substring(0, 10)}...`);
-                extractedKey = keyParam;
-                break;
-            }
-
-            // Check page content
-            const pageContent = await page.content();
-            const $ = cheerio.load(pageContent);
-            
-            const selectors = [
-                'pre', 'code', 'textarea', 
-                'input[name="key"]', 'input[name="token"]',
-                '#result', '.result', '.key', '#key', 
-                '.bypass-key', '#bypass-key',
-                '[data-key]', '[data-result]'
-            ];
-            
-            for (const selector of selectors) {
-                const element = $(selector).first();
-                let val = element.text().trim() || element.val();
-                if (val && val.length > 15 && !val.includes('http') && !val.includes('script')) {
-                    console.log(`[PlatoRelay] Extracted key from ${selector}`);
-                    extractedKey = val;
-                    break;
-                }
-            }
-            
-            if (extractedKey) break;
-
-            // Click any button to advance
-            const clicked = await page.evaluate(() => {
-                const buttons = Array.from(document.querySelectorAll(
-                    'button, a, div[role="button"], span[role="button"], ' +
-                    '[class*="btn"], [class*="button"], [class*="continue"], ' +
-                    '[class*="verify"], [class*="proceed"], [class*="next"]'
-                ));
-                
-                const targetTexts = ['continue', 'get key', 'free access', 'proceed', 'verify', 'next', 'claim', 'unlock'];
-                
-                for (const el of buttons) {
-                    const text = (el.innerText || el.textContent || '').toLowerCase().trim();
-                    if (text.includes('discord') || text.includes('support') || text.includes('tutorial')) continue;
-                    
-                    if (targetTexts.some(t => text.includes(t))) {
-                        el.scrollIntoView({ behavior: 'smooth', block: 'center' });
-                        el.click();
-                        return text;
-                    }
-                }
-                return null;
-            });
-
-            if (clicked) {
-                console.log(`[PlatoRelay] Clicked: "${clicked}"`);
-            }
-
-            // Handle Turnstile/Cloudflare challenges
-            try {
-                const frames = page.frames();
-                for (const frame of frames) {
-                    if (frame.url().includes('turnstile') || frame.url().includes('cloudflare')) {
-                        const checkbox = await frame.$('input[type="checkbox"], .chk, #challenge-stage');
-                        if (checkbox) await checkbox.click();
-                    }
-                }
-            } catch (e) {}
-        }
-
-        // =========================================================================
-        // FINAL EXTRACTION ATTEMPTS
-        // =========================================================================
-        if (!extractedKey) {
-            const finalContent = await page.content();
-            const $ = cheerio.load(finalContent);
-            
-            // Check JavaScript variables
-            const scripts = $('script').toArray();
-            for (const script of scripts) {
-                const content = $(script).html() || '';
-                const keyMatches = content.match(/['"]([A-Za-z0-9_\-]{25,})['"]/g);
-                if (keyMatches) {
-                    for (const match of keyMatches) {
-                        const clean = match.replace(/['"]/g, '');
-                        if (!clean.includes('http') && !clean.includes('script') && !clean.includes('function')) {
-                            extractedKey = clean;
-                            break;
-                        }
-                    }
-                }
-                if (extractedKey) break;
-            }
-        }
-
-        if (!extractedKey) {
-            const bodyText = await page.evaluate(() => document.body.innerText);
-            const keyRegex = /[A-Za-z0-9_\-]{25,}/g;
-            const matches = bodyText.match(keyRegex);
-            
-            if (matches) {
-                const excludedWords = ['script', 'function', 'window', 'document', 'javascript', 
-                                     'browser', 'chrome', 'firefox', 'chromium', 'cloudflare', 
-                                     'platorelay', 'completed', 'continue', 'undefined', 'null'];
-                
-                for (const key of matches) {
-                    if (!excludedWords.some(word => key.toLowerCase().includes(word)) && 
-                        !key.startsWith('http') && key.length > 15) {
-                        extractedKey = key;
-                        break;
-                    }
-                }
-            }
-        }
-
-        await browser.close();
-        browser = null;
-        
-        return extractedKey || 'Key not found on page';
-        
-    } catch (err) {
-        console.error(`[PlatoRelay] Error: ${err.message}`);
-        if (browser) {
-            await browser.close().catch(() => {});
-            browser = null;
-        }
-        throw new Error(`PlatoRelay bypass failed: ${err.message}`);
     }
 }
 
@@ -383,7 +461,6 @@ async function bypassGeneric(url) {
         const html = resp.data;
         const $ = cheerio.load(html);
 
-        // Try common key containers
         const selectors = [
             'pre', 'code', 'textarea',
             'input[name="key"]', 'input[id*="key"]', 'input[name="token"]',
@@ -402,7 +479,6 @@ async function bypassGeneric(url) {
             }
         }
 
-        // Check JavaScript variables
         const jsPatterns = [
             /var\s+key\s*=\s*['"]([^'"]+)['"]/i,
             /var\s+bypass\s*=\s*['"]([^'"]+)['"]/i,
@@ -426,7 +502,6 @@ async function bypassGeneric(url) {
             }
         }
 
-        // Look for long alphanumeric strings
         const bodyText = $('body').text();
         const keyRegex = /([A-Za-z0-9_\-]{20,60})/g;
         const allMatches = bodyText.match(keyRegex);
@@ -443,7 +518,6 @@ async function bypassGeneric(url) {
             }
         }
 
-        // Check for iframe or meta redirect
         const iframeSrc = $('iframe').attr('src');
         if (iframeSrc && iframeSrc.startsWith('http')) {
             return await bypassGeneric(iframeSrc);
@@ -473,14 +547,12 @@ app.post('/api/bypass', async (req, res) => {
         return res.status(400).json({ error: 'Missing "url" in body' });
     }
 
-    // Validate URL
     try {
         new URL(url);
     } catch {
         return res.status(400).json({ error: 'Invalid URL format' });
     }
 
-    // Check cache
     const cacheKey = url.toLowerCase();
     const cachedResult = cache.get(cacheKey);
     if (cachedResult) {
@@ -496,16 +568,14 @@ app.post('/api/bypass', async (req, res) => {
     let result;
 
     try {
-        // Route to appropriate handler
         if (lowerUrl.includes('platoboost.com') || lowerUrl.includes('gateway.platoboost.com')) {
             result = await bypassPlatoboost(url);
-        } else if (lowerUrl.includes('platorelay.com')) {
+        } else if (lowerUrl.includes('platorelay.com') || lowerUrl.includes('auth.platorelay.com')) {
             result = await bypassPlatoRelay(url);
         } else {
             result = await bypassGeneric(url);
         }
 
-        // Cache successful results
         if (result && !result.includes('Unable') && !result.includes('failed') && result.length > 5) {
             cache.set(cacheKey, result);
         }

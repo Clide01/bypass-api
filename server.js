@@ -65,119 +65,126 @@ async function bypassPlatoboost(url) {
   }
 }
 
+const puppeteer = require('puppeteer');
+
 /**
- * PlatoRelay handler
- * Example: https://auth.platorelay.com/a?d=...
- * This key system requires:
- * 1. Following the initial redirect chain
- * 2. Extracting the final key from the page (often in a specific element or redirect URL)
+ * PlatoRelay handler - uses headless browser to execute JS verification
  */
 async function bypassPlatoRelay(url) {
+  let browser;
   try {
-    // Step 1: Follow redirects to get to the final page
-    let resp = await axios.get(url, {
-      maxRedirects: 10,
-      headers: {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36',
-        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
-        'Accept-Language': 'en-US,en;q=0.5'
+    console.log(`[PlatoRelay] Launching browser for: ${url}`);
+    
+    browser = await puppeteer.launch({
+      headless: 'new',
+      args: [
+        '--no-sandbox',
+        '--disable-setuid-sandbox',
+        '--disable-dev-shm-usage',
+        '--disable-gpu',
+        '--single-process'
+      ]
+    });
+
+    const page = await browser.newPage();
+    
+    // Set a realistic user agent
+    await page.setUserAgent('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36');
+
+    // Block unnecessary resources to speed up
+    await page.setRequestInterception(true);
+    page.on('request', (req) => {
+      const type = req.resourceType();
+      if (type === 'image' || type === 'font' || type === 'stylesheet') {
+        req.abort();
+      } else {
+        req.continue();
       }
     });
 
-    const finalUrl = resp.request.res.responseUrl || url;
-    const html = resp.data;
-    const $ = cheerio.load(html);
+    console.log(`[PlatoRelay] Navigating...`);
+    
+    // Navigate to the URL and wait for possible redirects
+    await page.goto(url, {
+      waitUntil: 'networkidle2',
+      timeout: 30000
+    });
 
-    console.log(`[PlatoRelay] Final URL: ${finalUrl}`);
+    // Wait a bit for any JavaScript execution
+    await new Promise(resolve => setTimeout(resolve, 5000));
 
-    // Step 2: Check if the key is directly in the URL (some key systems append ?key=...)
+    // Get the final URL and page content
+    const finalUrl = page.url();
+    const pageContent = await page.content();
+    
+    console.log(`[PlatoRelay] Final URL after JS: ${finalUrl}`);
+
+    // Check if we got redirected to a URL with a key
     const urlObj = new URL(finalUrl);
-    const keyParam = urlObj.searchParams.get('key') || urlObj.searchParams.get('token') || urlObj.searchParams.get('result');
-    if (keyParam && keyParam.length > 10) {
+    const keyParam = urlObj.searchParams.get('key') || urlObj.searchParams.get('token');
+    if (keyParam && keyParam.length > 15) {
+      await browser.close();
       return keyParam;
     }
 
-    // Step 3: Look in common elements
+    // Check the page content for the key
+    const $ = cheerio.load(pageContent);
+    
+    // Look for key in text elements
     const selectors = [
       'pre', 'code', 'textarea',
       'input[name="key"]', 'input[id*="key"]',
-      'div.key', 'span.key',
-      '#result', '.result',
       '[class*="key"]', '[id*="key"]',
-      '.generated', '#generated'
+      '.generated', '#generated', '#result', '.result'
     ];
 
     for (const selector of selectors) {
       const element = $(selector).first();
-      let value = element.text().trim() || element.val();
-      if (value && value.length > 15 && !value.includes(' ') && value !== 'undefined') {
+      let value = element.text().trim() || (element.attr('value') || '');
+      if (value && value.length > 15 && !value.includes('http')) {
+        await browser.close();
         return value;
       }
     }
 
-    // Step 4: Look for the key in JavaScript redirects
-    // PlatoRelay often uses: window.location.href = "https://...?key=..."
-    const redirectPatterns = [
-      /window\.location\.href\s*=\s*['"]([^'"]+key=[^'"]+)['"]/i,
-      /window\.location\s*=\s*['"]([^'"]+key=[^'"]+)['"]/i,
-      /location\.replace\(['"]([^'"]+)['"]\)/i,
-    ];
-
-    for (const pattern of redirectPatterns) {
-      const match = html.match(pattern);
-      if (match && match[1]) {
-        const redirectUrl = new URL(match[1], finalUrl).href;
-        const keyFromRedirect = redirectUrl.match(/[?&]key=([^&\s"']+)/i);
-        if (keyFromRedirect) {
-          return decodeURIComponent(keyFromRedirect[1]);
-        }
-      }
-    }
-
-    // Step 5: Look for key in JSON/script tags
+    // Check if the key is in a <script> tag as a variable
     const scripts = $('script').toArray();
     for (const script of scripts) {
       const content = $(script).html() || '';
-      // Look for key assignments in scripts
-      const keyMatches = content.match(/['"]([A-Za-z0-9_\-]{25,})['"]/g);
-      if (keyMatches) {
-        for (const match of keyMatches) {
-          const clean = match.replace(/['"]/g, '');
-          if (clean.length > 20 && !clean.includes('http') && !clean.includes('script') && !clean.includes('function')) {
-            return clean;
-          }
-        }
+      const keyMatch = content.match(/['"]([A-Za-z0-9_\-]{25,})['"]/);
+      if (keyMatch && !keyMatch[1].includes('http')) {
+        await browser.close();
+        return keyMatch[1];
       }
     }
 
-    // Step 6: Check for iframe with key
-    const iframe = $('iframe').attr('src');
-    if (iframe) {
-      const iframeUrl = new URL(iframe, finalUrl).href;
-      console.log(`[PlatoRelay] Following iframe: ${iframeUrl}`);
-      const iframeResp = await axios.get(iframeUrl, {
-        headers: { 'User-Agent': 'Mozilla/5.0 ...' }
-      });
-      const iframeHtml = iframeResp.data;
-      const keyFromIframe = iframeHtml.match(/[A-Za-z0-9_\-]{25,}/);
-      if (keyFromIframe) {
-        return keyFromIframe[0];
-      }
-    }
-
-    // Step 7: Last resort - extract any long alphanumeric string
+    // Check for any long string that looks like a key
     const bodyText = $('body').text();
-    const longStrings = bodyText.match(/[A-Za-z0-9_\-]{20,60}/g) || [];
-    const excludedWords = ['script', 'function', 'window', 'document', 'javascript', 'stylesheet', 'analytics', 'google', 'facebook', 'bootstrap', 'jquery'];
+    const potentialKeys = bodyText.match(/[A-Za-z0-9_\-]{20,80}/g) || [];
+    const excludedWords = ['script', 'function', 'window', 'document', 'javascript', 'browser', 'chrome', 'firefox'];
     
-    for (const str of longStrings) {
-      if (!excludedWords.some(word => str.toLowerCase().includes(word)) && !str.startsWith('http')) {
-        return str;
+    for (const key of potentialKeys) {
+      if (!excludedWords.some(word => key.toLowerCase().includes(word)) && !key.startsWith('http')) {
+        await browser.close();
+        return key;
       }
+    }
+
+    // If we still haven't found it, check if there's a textarea or pre that appeared after JS execution
+    const visibleText = await page.evaluate(() => {
+      const el = document.querySelector('pre, code, textarea, .key, #key, [class*="generated"]');
+      return el ? el.textContent.trim() : null;
+    });
+
+    await browser.close();
+
+    if (visibleText && visibleText.length > 15) {
+      return visibleText;
     }
 
     return 'Key not found on page';
   } catch (err) {
+    if (browser) await browser.close().catch(() => {});
     throw new Error(`PlatoRelay bypass failed: ${err.message}`);
   }
 }

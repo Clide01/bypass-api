@@ -102,53 +102,17 @@ function isValidKey(key) {
 }
 
 // ================================================================
-// LAYER 1: EXTERNAL BYPASS RESOLVERS (Aggregator Fallback)
-// ================================================================
-
-async function tryExternalBypassers(url) {
-    const endpoints = [
-        `https://api.bypass.vip/bypass?url=${encodeURIComponent(url)}`,
-        `https://api.rce.wtf/bypass?url=${encodeURIComponent(url)}`
-    ];
-
-    for (const endpoint of endpoints) {
-        try {
-            console.log(`[ExternalResolver] Querying aggregator...`);
-            const res = await axios.get(endpoint, {
-                timeout: 12000,
-                headers: { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/126.0.0.0' }
-            });
-
-            if (res.data) {
-                const potentialKey = res.data.result || res.data.key || res.data.destination || res.data.bypassed || res.data.url;
-                if (potentialKey && typeof potentialKey === 'string' && (isValidKey(potentialKey) || isFreeKey(potentialKey))) {
-                    console.log(`[ExternalResolver] ✅ Successfully resolved key: ${potentialKey}`);
-                    return potentialKey.trim();
-                }
-            }
-        } catch (e) {
-            // Silently ignore aggregator errors and fall back to Puppeteer
-        }
-    }
-    return null;
-}
-
-// ================================================================
-// LAYER 2: ENHANCED PUPPETEER BYPASS ENGINE
+// STANDALONE PUPPETEER ENGINE (PlatoRelay & PlatoBoost)
 // ================================================================
 
 async function bypassPlatoRelay(url) {
-    // 1. Try external resolvers first for ad-protected checkpoints
-    const externalResult = await tryExternalBypassers(url);
-    if (externalResult) return externalResult;
-
     let browser = null;
     let page = null;
     let allExtractedKeys = [];
     let finalKey = null;
     
     try {
-        console.log(`[PlatoEngine] Starting headless bypass for: ${url.substring(0, 80)}...`);
+        console.log(`[PlatoEngine] Starting standalone headless bypass for: ${url.substring(0, 80)}...`);
 
         const chromiumArgs = await chromium.args;
         const baseArgs = Array.isArray(chromiumArgs) ? chromiumArgs : [];
@@ -173,6 +137,7 @@ async function bypassPlatoRelay(url) {
             ignoreDefaultArgs: ['--enable-automation']
         });
 
+        // Automatically close popup ads so Puppeteer stays on the main checkpoint tab
         browser.on('targetcreated', async (target) => {
             try {
                 if (target.type() === 'page') {
@@ -190,6 +155,9 @@ async function bypassPlatoRelay(url) {
         page = await browser.newPage();
         await page.setUserAgent('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36');
         
+        // =========================================================================
+        // NETWORK INTERCEPTOR: Catch JSON payloads containing keys from background fetch/XHR
+        // =========================================================================
         page.on('response', async (response) => {
             try {
                 const resUrl = response.url();
@@ -225,6 +193,9 @@ async function bypassPlatoRelay(url) {
         await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 30000 });
         await new Promise(resolve => setTimeout(resolve, 3000));
 
+        // =========================================================================
+        // CHECKPOINT LOOP (12 attempts @ 2.5s each = 30 seconds max)
+        // =========================================================================
         let stepCount = 0;
         const maxSteps = 12;
         let previousUrl = '';
@@ -249,6 +220,7 @@ async function bypassPlatoRelay(url) {
                     previousUrl = currentUrl;
                 }
 
+                // 1. CHECK URL PARAMETERS
                 try {
                     const urlObj = new URL(currentUrl);
                     const keyParam = urlObj.searchParams.get('key') || urlObj.searchParams.get('token') || urlObj.searchParams.get('k');
@@ -259,6 +231,7 @@ async function bypassPlatoRelay(url) {
                     }
                 } catch (e) {}
 
+                // 2. CHECK HTML TEXT CONTENT
                 const pageContent = await page.content();
                 const $ = cheerio.load(pageContent);
                 const bodyText = $('body').text();
@@ -285,6 +258,7 @@ async function bypassPlatoRelay(url) {
                 }
                 if (finalKey) break;
 
+                // 3. CHECK DOM ELEMENTS & INPUTS
                 const selectors = [
                     'pre', 'code', 'textarea', '.key', '#key', '.result', '#result',
                     '.free-key', '#free-key', '.bypass-key', '#bypass-key',
@@ -306,6 +280,7 @@ async function bypassPlatoRelay(url) {
                 }
                 if (finalKey) break;
 
+                // 4. CHECK LOCALSTORAGE & SESSIONSTORAGE
                 const memoryKey = await page.evaluate(() => {
                     for (let i = 0; i < localStorage.length; i++) {
                         const keyName = localStorage.key(i);
@@ -322,6 +297,7 @@ async function bypassPlatoRelay(url) {
                     break;
                 }
 
+                // 5. CLICK CLOUDFLARE TURNSTILE CHECKBOX IF PRESENT
                 try {
                     const frames = page.frames();
                     for (const frame of frames) {
@@ -332,6 +308,7 @@ async function bypassPlatoRelay(url) {
                     }
                 } catch (e) {}
 
+                // 6. CLICK CHECKPOINT BUTTONS
                 const clicked = await page.evaluate(() => {
                     const buttonTexts = [
                         'continue', 'get key', 'free access', 'proceed', 
@@ -377,6 +354,7 @@ async function bypassPlatoRelay(url) {
             return finalKey;
         }
 
+        // Fallback: Check valid candidates
         const freeKeys = allExtractedKeys.filter(key => isFreeKey(key) && isValidKey(key));
         if (freeKeys.length > 0) {
             await browser.close().catch(() => {});
@@ -403,9 +381,6 @@ async function bypassPlatoRelay(url) {
 // ================================================================
 
 async function bypassGeneric(url) {
-    const externalResult = await tryExternalBypassers(url);
-    if (externalResult) return externalResult;
-
     try {
         const resp = await axios.get(url, {
             maxRedirects: 10,

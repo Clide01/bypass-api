@@ -74,17 +74,19 @@ async function bypassPlatoRelay(url) {
     console.log(`[PlatoRelay] Launching browser for: ${url}`);
 
     browser = await puppeteer.launch({
-    args: [
+      args: [
         ...chromium.args,
         '--no-sandbox',
         '--disable-setuid-sandbox',
         '--disable-dev-shm-usage',
         '--disable-gpu',
-        '--single-process'
-    ],
-    defaultViewport: chromium.defaultViewport,
-    executablePath: await chromium.executablePath,
-    headless: true,
+        '--single-process',
+        '--no-zygote',                // Prevents extra background processes
+        '--js-flags=--max-old-space-size=256' // Caps V8 heap memory
+      ],
+      defaultViewport: chromium.defaultViewport,
+      executablePath: await chromium.executablePath,
+      headless: true,
     });
 
     const page = await browser.newPage();

@@ -47,7 +47,6 @@ const limiter = rateLimit({
     message: { error: 'Too many requests, please try again later.' },
     standardHeaders: true,
     legacyHeaders: false,
-    // Skip checking X-Forwarded-For header
     keyGenerator: (req) => {
         return req.ip || req.connection.remoteAddress;
     }
@@ -64,17 +63,80 @@ app.use('/api', (req, res, next) => {
 });
 
 // ================================================================
-// COMPLETELY REWRITTEN PLATORELAY HANDLER
+// IMPROVED EXTRACTION UTILITIES
+// ================================================================
+
+function isValidKey(key) {
+    if (!key || typeof key !== 'string') return false;
+    key = key.trim();
+    
+    // Must be at least 10 characters
+    if (key.length < 10) return false;
+    
+    // Must not be a common false positive
+    const falsePositives = [
+        'undefined', 'null', 'true', 'false', 'nan', 'infinity',
+        'script', 'function', 'window', 'document', 'javascript',
+        'localhost', 'https', 'http', 'www', 'com', 'org', 'net',
+        'cloudflare', 'platorelay', 'platoboost', 'linkvertise',
+        'please', 'wait', 'continue', 'loading', 'processing',
+        'discord', 'support', 'tutorial', 'home', 'login', 'signup'
+    ];
+    
+    if (falsePositives.some(word => key.toLowerCase().includes(word))) {
+        return false;
+    }
+    
+    // Must contain letters or be a proper key format
+    const hasLetters = /[a-zA-Z]/.test(key);
+    const hasNumbers = /[0-9]/.test(key);
+    
+    // Keys should be alphanumeric with underscores or dashes
+    const isValidFormat = /^[A-Za-z0-9_\-]+$/.test(key);
+    
+    return (hasLetters || hasNumbers) && isValidFormat;
+}
+
+function isFreeKey(key) {
+    if (!key || typeof key !== 'string') return false;
+    key = key.trim().toUpperCase();
+    // Key starts with FREE or contains FREE as a word
+    return key.startsWith('FREE') || key.includes('FREE_') || key.includes('FREE-');
+}
+
+function isLikelyKey(key) {
+    if (!key || typeof key !== 'string') return false;
+    key = key.trim();
+    
+    // Must be a reasonable length
+    if (key.length < 15 || key.length > 80) return false;
+    
+    // Must not be a hash (hexadecimal only)
+    if (/^[0-9a-f]{32}$/i.test(key)) return false;
+    
+    // Must not be base64 encoded (looks like random characters)
+    if (/^[A-Za-z0-9+/=]+$/.test(key) && key.length > 30) {
+        // Check if it's likely base64
+        const base64Score = (key.match(/[A-Z]/g) || []).length / key.length;
+        if (base64Score > 0.7) return false;
+    }
+    
+    return isValidKey(key);
+}
+
+// ================================================================
+// COMPLETELY REWRITTEN PLATORELAY HANDLER WITH BETTER EXTRACTION
 // ================================================================
 
 async function bypassPlatoRelay(url) {
     let browser = null;
     let page = null;
+    let allExtractedKeys = [];
     
     try {
         console.log(`[PlatoRelay] Starting bypass for: ${url.substring(0, 100)}...`);
 
-        // Launch browser with more permissive settings
+        // Launch browser
         const chromiumArgs = await chromium.args;
         const baseArgs = Array.isArray(chromiumArgs) ? chromiumArgs : [];
 
@@ -117,31 +179,23 @@ async function bypassPlatoRelay(url) {
             ignoreDefaultArgs: ['--enable-automation']
         });
 
-        // CRITICAL FIX: Don't automatically close pages - handle popups differently
-        const popupUrls = new Set();
-        
+        // Handle popups
         browser.on('targetcreated', async (target) => {
             try {
                 if (target.type() === 'page') {
                     const newPage = await target.page();
                     if (newPage) {
                         const pageUrl = await newPage.url().catch(() => 'about:blank');
-                        // Only close if it's a blank popup or ad
-                        if (pageUrl === 'about:blank') {
-                            console.log(`[PlatoRelay] Closing blank popup`);
+                        if (pageUrl === 'about:blank' || 
+                            pageUrl.includes('google') || 
+                            pageUrl.includes('doubleclick') || 
+                            pageUrl.includes('facebook') || 
+                            pageUrl.includes('twitter')) {
                             await newPage.close().catch(() => {});
-                        } else if (pageUrl.includes('google') || pageUrl.includes('doubleclick') || 
-                                   pageUrl.includes('facebook') || pageUrl.includes('twitter')) {
-                            console.log(`[PlatoRelay] Closing ad popup: ${pageUrl}`);
-                            await newPage.close().catch(() => {});
-                        } else {
-                            console.log(`[PlatoRelay] Keeping page: ${pageUrl.substring(0, 50)}...`);
                         }
                     }
                 }
-            } catch (e) {
-                // Ignore popup handling errors
-            }
+            } catch (e) {}
         });
 
         // Create main page
@@ -155,7 +209,6 @@ async function bypassPlatoRelay(url) {
         page.on('request', (req) => {
             const type = req.resourceType();
             const url = req.url();
-            // Block tracking and ads
             if (['image', 'media', 'font'].includes(type) ||
                 url.includes('google-analytics') ||
                 url.includes('doubleclick') ||
@@ -180,7 +233,7 @@ async function bypassPlatoRelay(url) {
 
         console.log(`[PlatoRelay] Navigating to URL...`);
         
-        // Navigate with multiple attempts
+        // Navigate with retries
         let navigationSuccess = false;
         let currentUrl = url;
         
@@ -198,22 +251,17 @@ async function bypassPlatoRelay(url) {
                     console.log(`[PlatoRelay] Navigation successful! Status: ${response.status()}`);
                     break;
                 } else if (response) {
-                    console.log(`[PlatoRelay] Navigation completed with status: ${response ? response.status() : 'unknown'}`);
                     navigationSuccess = true;
                     break;
                 }
             } catch (navError) {
                 console.log(`[PlatoRelay] Navigation attempt ${navAttempt} failed: ${navError.message}`);
-                
-                // If page was closed, recreate it
                 if (navError.message.includes('closed') || navError.message.includes('Session closed')) {
-                    console.log('[PlatoRelay] Page was closed, recreating...');
                     try {
                         await page.close().catch(() => {});
                         page = await browser.newPage();
                         await page.setUserAgent('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36');
                         await page.setRequestInterception(true);
-                        // Re-setup request interception
                         page.on('request', (req) => {
                             const type = req.resourceType();
                             const url = req.url();
@@ -225,141 +273,215 @@ async function bypassPlatoRelay(url) {
                                 req.continue();
                             }
                         });
-                    } catch (e) {
-                        console.log(`[PlatoRelay] Failed to recreate page: ${e.message}`);
-                    }
+                    } catch (e) {}
                 }
-                
                 if (navAttempt < 3) {
-                    console.log('[PlatoRelay] Waiting 2 seconds before retry...');
                     await new Promise(resolve => setTimeout(resolve, 2000));
                 }
             }
         }
 
-        if (!navigationSuccess) {
-            console.log('[PlatoRelay] All navigation attempts failed, but continuing...');
-        }
-
-        // Wait a bit for page to settle
+        // Wait for page to settle
         await new Promise(resolve => setTimeout(resolve, 3000));
-
-        // Check current URL
-        try {
-            currentUrl = await page.url();
-            console.log(`[PlatoRelay] Current URL: ${currentUrl}`);
-        } catch (e) {
-            console.log(`[PlatoRelay] Could not get current URL: ${e.message}`);
-        }
 
         // Check for Cloudflare
         try {
             const pageTitle = await page.title();
             if (pageTitle && (pageTitle.includes('Just a moment') || pageTitle.includes('Attention Required') || pageTitle.includes('Cloudflare'))) {
-                // Wait for Cloudflare to resolve
                 console.log('[PlatoRelay] Cloudflare detected, waiting...');
-                await new Promise(resolve => setTimeout(resolve, 8000));
+                await new Promise(resolve => setTimeout(resolve, 10000));
             }
-        } catch (e) {
-            // Ignore title errors
-        }
+        } catch (e) {}
 
         // =========================================================================
-        // EXTRACTION LOOP
+        // ENHANCED EXTRACTION LOOP - PRIORITIZING "FREE" KEYS
         // =========================================================================
         let extractedKey = null;
-        const maxAttempts = 20;
+        const maxAttempts = 25;
 
         for (let attempt = 1; attempt <= maxAttempts; attempt++) {
             console.log(`[PlatoRelay] Extraction attempt ${attempt}/${maxAttempts}...`);
             
             try {
-                await new Promise(resolve => setTimeout(resolve, 3000));
+                await new Promise(resolve => setTimeout(resolve, 2500));
 
                 // Check if page is still alive
                 try {
                     const currentUrl = await page.url();
                     if (currentUrl === 'about:blank') {
-                        console.log('[PlatoRelay] Page is blank, attempting recovery...');
+                        console.log('[PlatoRelay] Page is blank, continuing...');
                         continue;
                     }
                 } catch (e) {
-                    console.log('[PlatoRelay] Page check failed, continuing...');
                     continue;
                 }
 
-                // Check URL parameters
+                // 1. Check URL parameters first (quickest)
                 try {
                     const currentUrl = await page.url();
                     const urlObj = new URL(currentUrl);
                     
-                    const keyParam = urlObj.searchParams.get('key') || 
-                                   urlObj.searchParams.get('token') || 
-                                   urlObj.searchParams.get('k') ||
-                                   urlObj.searchParams.get('code') ||
-                                   urlObj.searchParams.get('id') ||
-                                   urlObj.searchParams.get('result');
-                    
-                    if (keyParam && keyParam.length > 15) {
-                        console.log(`[PlatoRelay] Found key in URL: ${keyParam.substring(0, 15)}...`);
-                        extractedKey = keyParam;
-                        break;
+                    const paramNames = ['key', 'token', 'k', 'code', 'id', 'result', 'free', 'freekey', 'keycode'];
+                    for (const param of paramNames) {
+                        const value = urlObj.searchParams.get(param);
+                        if (value && value.length > 10) {
+                            console.log(`[PlatoRelay] Found potential key in URL param ${param}: ${value.substring(0, 20)}...`);
+                            // Check if it starts with FREE
+                            if (value.toUpperCase().startsWith('FREE')) {
+                                console.log(`[PlatoRelay] ✅ Found FREE key in URL!`);
+                                extractedKey = value;
+                                break;
+                            }
+                            // Store as candidate
+                            if (isLikelyKey(value)) {
+                                allExtractedKeys.push(value);
+                            }
+                        }
                     }
-                } catch (e) {
-                    // Ignore URL parsing errors
-                }
+                    if (extractedKey) break;
+                } catch (e) {}
 
-                // Check page content
+                // 2. Get page content
                 try {
                     const pageContent = await page.content();
                     if (!pageContent || pageContent.length < 100) {
-                        console.log('[PlatoRelay] Page content is empty or too short');
                         continue;
                     }
                     
                     const $ = cheerio.load(pageContent);
                     
-                    const selectors = [
+                    // 3. Check specific elements that might contain the key
+                    const keySelectors = [
                         'pre', 'code', 'textarea',
-                        'input[name="key"]', 'input[name="token"]',
-                        '#result', '.result', '.key', '#key',
+                        '.key', '#key', '.result', '#result',
+                        '.free-key', '#free-key',
                         '.bypass-key', '#bypass-key',
-                        '[data-key]', '[data-result]',
                         '.generated-key', '#generated-key',
+                        '.output', '#output', '.response', '#response',
                         '.script-key', '#script-key',
-                        '.output', '#output',
-                        '.response', '#response'
+                        '[data-key]', '[data-result]', '[data-free]'
                     ];
                     
-                    for (const selector of selectors) {
+                    for (const selector of keySelectors) {
                         try {
                             const elements = $(selector);
                             if (elements.length > 0) {
                                 const element = elements.first();
                                 let val = element.text().trim() || element.val();
-                                if (val && val.length > 15 && 
-                                    !val.includes('http') && 
-                                    !val.includes('script') && 
-                                    !val.includes('function') &&
-                                    !val.includes('undefined') &&
-                                    !val.includes('null') &&
-                                    !val.includes(' ')) {
-                                    console.log(`[PlatoRelay] Found key in ${selector}: ${val.substring(0, 15)}...`);
+                                if (val && val.length > 10) {
+                                    console.log(`[PlatoRelay] Found potential key in ${selector}: ${val.substring(0, 20)}...`);
+                                    
+                                    // Check if it starts with FREE
+                                    if (val.toUpperCase().startsWith('FREE')) {
+                                        console.log(`[PlatoRelay] ✅ Found FREE key in ${selector}!`);
+                                        extractedKey = val;
+                                        break;
+                                    }
+                                    
+                                    // Store as candidate
+                                    if (isLikelyKey(val)) {
+                                        allExtractedKeys.push(val);
+                                    }
+                                }
+                            }
+                        } catch (e) {}
+                    }
+                    if (extractedKey) break;
+
+                    // 4. Search for "FREE" in the page text
+                    try {
+                        const bodyText = $('body').text();
+                        
+                        // Look for patterns like FREE_XXXXXXXX or FREE-XXXXXXXX
+                        const freePatterns = [
+                            /FREE_[A-Za-z0-9]{8,}/g,
+                            /FREE-[A-Za-z0-9]{8,}/g,
+                            /FREE[A-Za-z0-9_\-]{8,}/g,
+                            /FREE\s*[:=]\s*['"]([^'"]+)['"]/g,
+                            /['"](FREE[A-Za-z0-9_\-]{10,})['"]/g,
+                            /(FREE[A-Za-z0-9_\-]{10,})/g
+                        ];
+                        
+                        for (const pattern of freePatterns) {
+                            const matches = bodyText.match(pattern);
+                            if (matches) {
+                                for (const match of matches) {
+                                    // Clean up the match
+                                    let clean = match.replace(/['"]/g, '').trim();
+                                    // Extract just the key part
+                                    const keyMatch = clean.match(/(FREE[A-Za-z0-9_\-]{10,})/);
+                                    if (keyMatch) {
+                                        const key = keyMatch[1];
+                                        console.log(`[PlatoRelay] ✅ Found FREE key in text: ${key}`);
+                                        extractedKey = key;
+                                        break;
+                                    }
+                                }
+                            }
+                            if (extractedKey) break;
+                        }
+                        if (extractedKey) break;
+                    } catch (e) {}
+
+                    // 5. Search JavaScript for FREE keys
+                    try {
+                        const scripts = $('script').toArray();
+                        for (const script of scripts) {
+                            const content = $(script).html() || '';
+                            
+                            // Look for FREE keys in JS
+                            const jsPatterns = [
+                                /['"](FREE[A-Za-z0-9_\-]{10,})['"]/g,
+                                /FREE_[A-Za-z0-9]{8,}/g,
+                                /FREE-[A-Za-z0-9]{8,}/g,
+                                /FREE[A-Za-z0-9_\-]{10,}/g
+                            ];
+                            
+                            for (const pattern of jsPatterns) {
+                                const matches = content.match(pattern);
+                                if (matches) {
+                                    for (const match of matches) {
+                                        const clean = match.replace(/['"]/g, '').trim();
+                                        const keyMatch = clean.match(/(FREE[A-Za-z0-9_\-]{10,})/);
+                                        if (keyMatch) {
+                                            const key = keyMatch[1];
+                                            console.log(`[PlatoRelay] ✅ Found FREE key in JavaScript: ${key}`);
+                                            extractedKey = key;
+                                            break;
+                                        }
+                                    }
+                                }
+                                if (extractedKey) break;
+                            }
+                            if (extractedKey) break;
+                        }
+                        if (extractedKey) break;
+                    } catch (e) {}
+
+                    // 6. Check input fields for values
+                    try {
+                        const inputs = $('input[type="text"], input[type="hidden"]');
+                        for (const input of inputs) {
+                            const val = $(input).val();
+                            if (val && val.length > 10) {
+                                if (val.toUpperCase().startsWith('FREE')) {
+                                    console.log(`[PlatoRelay] ✅ Found FREE key in input!`);
                                     extractedKey = val;
                                     break;
                                 }
+                                if (isLikelyKey(val)) {
+                                    allExtractedKeys.push(val);
+                                }
                             }
-                        } catch (e) {
-                            continue;
                         }
-                    }
-                    
-                    if (extractedKey) break;
+                        if (extractedKey) break;
+                    } catch (e) {}
+
                 } catch (e) {
                     console.log(`[PlatoRelay] Content extraction error: ${e.message}`);
                 }
 
-                // Try to click buttons
+                // 7. Try to click buttons to advance
                 try {
                     const clicked = await page.evaluate(() => {
                         const buttons = Array.from(document.querySelectorAll(
@@ -391,12 +513,11 @@ async function bypassPlatoRelay(url) {
 
                     if (clicked) {
                         console.log(`[PlatoRelay] Clicked: "${clicked}"`);
+                        await new Promise(resolve => setTimeout(resolve, 2000));
                     }
-                } catch (e) {
-                    // Ignore click errors
-                }
+                } catch (e) {}
 
-                // Handle Cloudflare challenges
+                // 8. Handle Cloudflare challenges
                 try {
                     const frames = page.frames();
                     for (const frame of frames) {
@@ -415,56 +536,47 @@ async function bypassPlatoRelay(url) {
                     }
                 } catch (e) {}
 
-                // Try to extract from JavaScript
-                try {
-                    const pageContent = await page.content();
-                    if (pageContent) {
-                        const jsMatches = pageContent.match(/['"]([A-Za-z0-9_\-]{30,50})['"]/g);
-                        if (jsMatches) {
-                            for (const match of jsMatches) {
-                                const clean = match.replace(/['"]/g, '');
-                                if (!clean.includes('http') && 
-                                    !clean.includes('script') && 
-                                    !clean.includes('function') && 
-                                    !clean.includes('window') &&
-                                    !clean.includes('document') &&
-                                    clean.length > 25) {
-                                    console.log(`[PlatoRelay] Found key in JavaScript: ${clean.substring(0, 15)}...`);
-                                    extractedKey = clean;
-                                    break;
-                                }
-                            }
-                        }
-                    }
-                    if (extractedKey) break;
-                } catch (e) {}
-
-                // Try to extract from text
-                try {
-                    const bodyText = await page.evaluate(() => document.body.innerText);
-                    if (bodyText) {
-                        const textMatches = bodyText.match(/[A-Za-z0-9_\-]{30,50}/g);
-                        if (textMatches) {
-                            const excludedWords = ['script', 'function', 'window', 'document', 
-                                                 'javascript', 'cloudflare', 'platorelay', 
-                                                 'undefined', 'null', 'localhost', 'https'];
-                            for (const match of textMatches) {
-                                if (!excludedWords.some(word => match.toLowerCase().includes(word)) &&
-                                    !match.startsWith('http') && match.length > 25) {
-                                    console.log(`[PlatoRelay] Found key in text: ${match.substring(0, 15)}...`);
-                                    extractedKey = match;
-                                    break;
-                                }
-                            }
-                        }
-                    }
-                    if (extractedKey) break;
-                } catch (e) {}
-
             } catch (loopError) {
                 console.log(`[PlatoRelay] Loop iteration ${attempt} error: ${loopError.message}`);
                 continue;
             }
+        }
+
+        // =========================================================================
+        // FINAL EXTRACTION - PRIORITIZE FREE KEYS
+        // =========================================================================
+        
+        // If we found a FREE key, use it
+        if (extractedKey && isFreeKey(extractedKey)) {
+            console.log(`[PlatoRelay] ✅ Using FREE key: ${extractedKey}`);
+            await browser.close().catch(() => {});
+            return extractedKey;
+        }
+
+        // If we have a key that starts with FREE but wasn't caught
+        const freeKeyCandidates = allExtractedKeys.filter(key => isFreeKey(key));
+        if (freeKeyCandidates.length > 0) {
+            const bestKey = freeKeyCandidates[0];
+            console.log(`[PlatoRelay] ✅ Using FREE key from candidates: ${bestKey}`);
+            await browser.close().catch(() => {});
+            return bestKey;
+        }
+
+        // Check all extracted keys for FREE pattern
+        for (const key of allExtractedKeys) {
+            if (isFreeKey(key)) {
+                console.log(`[PlatoRelay] ✅ Using FREE key from all keys: ${key}`);
+                await browser.close().catch(() => {});
+                return key;
+            }
+        }
+
+        // Fallback: look for any key
+        const validKeys = allExtractedKeys.filter(key => isValidKey(key));
+        if (validKeys.length > 0) {
+            console.log(`[PlatoRelay] Using best valid key: ${validKeys[0]}`);
+            await browser.close().catch(() => {});
+            return validKeys[0];
         }
 
         // Clean up
@@ -473,7 +585,7 @@ async function bypassPlatoRelay(url) {
             browser = null;
         }
         
-        return extractedKey || 'Key not found on page';
+        return 'Key not found on page';
         
     } catch (err) {
         console.error(`[PlatoRelay] Fatal error: ${err.message}`);
@@ -524,6 +636,12 @@ async function bypassPlatoboost(url) {
             },
             () => {
                 const bodyText = $('body').text();
+                const keyRegex = /FREE[A-Za-z0-9_\-]{10,}/;
+                const match = bodyText.match(keyRegex);
+                return match ? match[0] : null;
+            },
+            () => {
+                const bodyText = $('body').text();
                 const keyRegex = /[A-Za-z0-9_\-]{25,}/;
                 const match = bodyText.match(keyRegex);
                 return match ? match[0] : null;
@@ -533,7 +651,14 @@ async function bypassPlatoboost(url) {
         for (const extractor of extractors) {
             const result = extractor();
             if (result && result.length > 15 && !result.includes('http') && !result.includes('script')) {
-                return result;
+                // Prioritize keys that start with FREE
+                if (result.toUpperCase().startsWith('FREE')) {
+                    return result;
+                }
+                // Store but continue looking for FREE
+                if (result.length > 20) {
+                    return result;
+                }
             }
         }
 
@@ -557,7 +682,7 @@ async function bypassPlatoboost(url) {
 }
 
 /**
- * Generic bypass handler
+ * Generic bypass handler with FREE key prioritization
  */
 async function bypassGeneric(url) {
     try {
@@ -576,6 +701,17 @@ async function bypassGeneric(url) {
         const html = resp.data;
         const $ = cheerio.load(html);
 
+        // First try to find FREE keys
+        const bodyText = $('body').text();
+        const freeMatches = bodyText.match(/FREE[A-Za-z0-9_\-]{10,}/g);
+        if (freeMatches) {
+            for (const match of freeMatches) {
+                if (match.length > 15 && !match.includes('http')) {
+                    return match;
+                }
+            }
+        }
+
         const selectors = [
             'pre', 'code', 'textarea',
             'input[name="key"]', 'input[id*="key"]', 'input[name="token"]',
@@ -583,14 +719,20 @@ async function bypassGeneric(url) {
             '.generated-key', '#generated-key',
             '.bypass-key', '#bypass-key',
             '.result', '#result', '.bypass-result',
-            '[data-key]', '[data-token]'
+            '[data-key]', '[data-token]',
+            '.free-key', '#free-key'
         ];
 
         for (const selector of selectors) {
             const element = $(selector).first();
             let value = element.text().trim() || element.val();
             if (value && value.length > 10 && !value.includes(' ') && value !== 'undefined' && value !== 'null') {
-                return value;
+                if (value.toUpperCase().startsWith('FREE')) {
+                    return value;
+                }
+                if (value.length > 20) {
+                    return value;
+                }
             }
         }
 
@@ -601,6 +743,7 @@ async function bypassGeneric(url) {
             /var\s+token\s*=\s*['"]([^'"]+)['"]/i,
             /const\s+\w+\s*=\s*['"]([A-Za-z0-9_\-]{25,})['"]/g,
             /let\s+\w+\s*=\s*['"]([A-Za-z0-9_\-]{25,})['"]/g,
+            /['"](FREE[A-Za-z0-9_\-]{10,})['"]/g,
             /['"]([A-Za-z0-9_\-]{25,})['"]/g
         ];
 
@@ -611,13 +754,17 @@ async function bypassGeneric(url) {
                     let clean = match.replace(/^['"]|['"]$/g, '').trim();
                     clean = clean.replace(/^(var|const|let)\s+\w+\s*=\s*['"]/i, '');
                     if (clean.length > 15 && !clean.includes('http') && !clean.includes(' ') && !clean.includes('undefined')) {
-                        return clean;
+                        if (clean.toUpperCase().startsWith('FREE')) {
+                            return clean;
+                        }
+                        if (clean.length > 20) {
+                            return clean;
+                        }
                     }
                 }
             }
         }
 
-        const bodyText = $('body').text();
         const keyRegex = /([A-Za-z0-9_\-]{20,60})/g;
         const allMatches = bodyText.match(keyRegex);
         
@@ -628,7 +775,12 @@ async function bypassGeneric(url) {
             for (const match of allMatches) {
                 if (!excludedWords.some(word => match.toLowerCase().includes(word)) && 
                     !match.toLowerCase().includes('http') && !match.includes(' ')) {
-                    return match;
+                    if (match.toUpperCase().startsWith('FREE')) {
+                        return match;
+                    }
+                    if (match.length > 20) {
+                        return match;
+                    }
                 }
             }
         }

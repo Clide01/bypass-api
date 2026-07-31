@@ -62,21 +62,18 @@ async function bypassPlatoboost(url) {
 }
 
 const puppeteer = require('puppeteer-core');
-const chromium = require('@sparticuz/chromium');
+const chromiumModule = require('@sparticuz/chromium');
+// Fix CommonJS/ESM interop by unwrapping .default if present
+const chromium = chromiumModule.default || chromiumModule;
 
 async function bypassPlatoRelay(url) {
   let browser;
   try {
     console.log(`[PlatoRelay] Launching browser for: ${url}`);
 
-    // FIX 1: Explicitly await chromium.args and ensure it resolves to an array
-    const chromiumArgs = await chromium.args;
-    const baseArgs = Array.isArray(chromiumArgs) ? chromiumArgs : [];
-
-    // FIX 2: Correctly pass the resolved array without causing iterable errors
     browser = await puppeteer.launch({
       args: [
-        ...baseArgs,
+        ...chromium.args,
         '--no-sandbox',
         '--disable-setuid-sandbox',
         '--disable-dev-shm-usage',
@@ -86,13 +83,13 @@ async function bypassPlatoRelay(url) {
         '--js-flags=--max-old-space-size=256'
       ],
       defaultViewport: chromium.defaultViewport,
-      executablePath: await chromium.executablePath(), // Added parentheses () just in case your package version requires calling it
+      executablePath: await chromium.executablePath(),
       headless: true,
     });
 
     const page = await browser.newPage();
 
-    // Block unnecessary resources to speed up
+    // Block unnecessary resources to speed up execution and save RAM
     await page.setRequestInterception(true);
     page.on('request', (req) => {
       const type = req.resourceType();

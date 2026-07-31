@@ -1,12 +1,26 @@
 const express = require('express');
 const axios = require('axios');
 const cheerio = require('cheerio');
-const API_KEY = process.env.API_KEY || 'my-secret-key';
 
 const app = express();
 app.use(express.json());
 
-// --- BYPASS HANDLERS ---
+// --- API KEY PROTECTION ---
+// Use environment variable or a default for development
+const API_KEY = process.env.API_KEY || 'my-secret-key';
+
+// Protect all routes under /api with the key
+app.use('/api', (req, res, next) => {
+  const providedKey = req.headers['x-api-key'];
+  if (providedKey !== API_KEY) {
+    return res.status(403).json({ error: 'Invalid API key' });
+  }
+  next();
+});
+
+// ================================================================
+// BYPASS HANDLERS
+// ================================================================
 
 /**
  * Platoboost handler: follows redirects to extract a key.
@@ -23,95 +37,125 @@ async function bypassPlatoboost(url) {
       }
     });
 
-    // Often the key is inside a <pre> or <code> tag
+    // Often the key is inside a <pre>, <code> or <textarea> tag
     const $ = cheerio.load(resp.data);
-    const key = $('pre, code, textarea').first().text().trim();
+    let key = $('pre, code, textarea').first().text().trim();
     if (key && key.length > 10) return key;
 
-    // Fallback: follow a possible redirect link
+    // Fallback: look for a JavaScript redirect
     const redirectMatch = resp.data.match(/window\.location\s*=\s*['"]([^'"]+)['"]/);
     if (redirectMatch) {
       const nextUrl = new URL(redirectMatch[1], url).href;
       const redirectResp = await axios.get(nextUrl, {
         maxRedirects: 5,
-        headers: { 'User-Agent': '...' }
+        headers: { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36' }
       });
       const $2 = cheerio.load(redirectResp.data);
-      const key2 = $2('pre, code, textarea').first().text().trim();
-      return key2 || 'Key not found after redirect';
+      key = $2('pre, code, textarea').first().text().trim();
+      if (key) return key;
     }
 
-    return 'Unable to extract key';
+    // Last attempt: search for a long alphanumeric string (typical key format)
+    const bodyText = $('body').text();
+    const keyRegex = /[A-Za-z0-9_\-]{20,}/;
+    const match = bodyText.match(keyRegex);
+    return match ? match[0] : 'Unable to extract key';
   } catch (err) {
     throw new Error(`Platoboost bypass failed: ${err.message}`);
   }
 }
 
-// --- GENERIC BYPASS (linkvertise, lootlabs, etc.) ---
+/**
+ * Generic bypass handler for other ad-links (Linkvertise, LootLabs, etc.).
+ * Attempts to follow redirects and find a key on the final page.
+ */
 async function bypassGeneric(url) {
-  // Many ad-links finally redirect to the target if we use the correct headers
   try {
-    const resp = await axios.get(url, {
+    // Disable automatic redirects so we can follow them manually
+    let resp = await axios.get(url, {
       maxRedirects: 0,
       headers: {
-        'User-Agent': 'Mozilla/5.0 ...',
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
         'Accept': 'text/html,application/xhtml+xml',
         'Referer': url
       }
     });
 
-    // If it returns a 301/302 redirect, follow it automatically
-    if (resp.status === 301 || resp.status === 302) {
+    // Follow redirects manually (301, 302, 303, 307, 308)
+    const redirectStatuses = [301, 302, 303, 307, 308];
+    let redirectCount = 0;
+    const maxRedirects = 10;
+
+    while (redirectStatuses.includes(resp.status) && redirectCount < maxRedirects) {
       const location = resp.headers.location;
       if (!location) throw new Error('Redirect without location');
-      // Recursive follow (simple)
-      return bypassGeneric(new URL(location, url).href);
+      url = new URL(location, url).href;
+      resp = await axios.get(url, {
+        maxRedirects: 0,
+        headers: { 'User-Agent': 'Mozilla/5.0 ...' }
+      });
+      redirectCount++;
     }
 
-    // Otherwise, try to find a key in the body
+    // Now parse the final page for a key
     const $ = cheerio.load(resp.data);
-    const key = $('pre, code, textarea, input[name="key"]').first().text().trim()
-               || $('body').text().match(/[A-Z0-9_]{20,}/)?.[0];
-    return key || 'Key not found on page';
+
+    // Common key containers
+    let key = $('pre, code, textarea, input[name="key"]').first().text().trim();
+    if (key && key.length > 10) return key;
+
+    // Try to extract a long alphanumeric string (typical key format)
+    const bodyText = $('body').text();
+    const keyRegex = /[A-Za-z0-9_\-]{20,}/;
+    const match = bodyText.match(keyRegex);
+    return match ? match[0] : 'Key not found on page';
   } catch (err) {
     throw new Error(`Generic bypass failed: ${err.message}`);
   }
 }
 
-// --- MAIN BYPASS ENDPOINT ---
+// ================================================================
+// MAIN BYPASS ENDPOINT
+// ================================================================
 app.post('/api/bypass', async (req, res) => {
   const { url } = req.body;
-  if (!url) return res.status(400).json({ error: 'Missing "url" in body' });
+  if (!url) {
+    return res.status(400).json({ error: 'Missing "url" in body' });
+  }
 
   const lowerUrl = url.toLowerCase();
   let result;
 
   try {
+    // Route to the appropriate handler based on the domain
     if (lowerUrl.includes('platoboost.com') || lowerUrl.includes('gateway.platoboost.com')) {
       result = await bypassPlatoboost(url);
     } else if (lowerUrl.includes('linkvertise.com') || lowerUrl.includes('lootlabs.com')) {
-      // For now, use generic – you can write dedicated handlers later
+      // Use generic handler for now; you can add dedicated ones later
       result = await bypassGeneric(url);
     } else {
-      // Fallback
+      // Fallback to generic handler
       result = await bypassGeneric(url);
     }
 
-    res.json({ result });
+    return res.json({ result });
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    console.error(`Bypass error for ${url}:`, err.message);
+    return res.status(500).json({ error: err.message });
   }
 });
 
-app.use((req, res, next) => {
-  if (req.headers['x-api-key'] !== API_KEY) {
-    return res.status(403).json({ error: 'Invalid API key' });
-  }
-  next();
+// ================================================================
+// HEALTH CHECK (no API key required)
+// ================================================================
+app.get('/', (req, res) => {
+  res.send('Custom Bypass API running');
 });
 
-// --- HEALTH CHECK ---
-app.get('/', (req, res) => res.send('Custom Bypass API running'));
-
+// ================================================================
+// START SERVER
+// ================================================================
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log(`API on port ${PORT}`));
+app.listen(PORT, () => {
+  console.log(`API server listening on port ${PORT}`);
+});

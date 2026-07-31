@@ -1,13 +1,9 @@
 const express = require('express');
 const axios = require('axios');
 const cheerio = require('cheerio');
-
+const API_KEY = process.env.API_KEY || 'my-secret-key';
 const app = express();
 app.use(express.json());
-
-// --- API KEY PROTECTION ---
-// Use environment variable or a default for development
-const API_KEY = process.env.API_KEY || 'my-secret-key';
 
 // Protect all routes under /api with the key
 app.use('/api', (req, res, next) => {
@@ -73,19 +69,24 @@ async function bypassPlatoRelay(url) {
   try {
     console.log(`[PlatoRelay] Launching browser for: ${url}`);
 
+    // FIX 1: Explicitly await chromium.args and ensure it resolves to an array
+    const chromiumArgs = await chromium.args;
+    const baseArgs = Array.isArray(chromiumArgs) ? chromiumArgs : [];
+
+    // FIX 2: Correctly pass the resolved array without causing iterable errors
     browser = await puppeteer.launch({
       args: [
-        ...chromium.args,
+        ...baseArgs,
         '--no-sandbox',
         '--disable-setuid-sandbox',
         '--disable-dev-shm-usage',
         '--disable-gpu',
         '--single-process',
-        '--no-zygote',                // Prevents extra background processes
-        '--js-flags=--max-old-space-size=256' // Caps V8 heap memory
+        '--no-zygote',
+        '--js-flags=--max-old-space-size=256'
       ],
       defaultViewport: chromium.defaultViewport,
-      executablePath: await chromium.executablePath,
+      executablePath: await chromium.executablePath(), // Added parentheses () just in case your package version requires calling it
       headless: true,
     });
 

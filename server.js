@@ -71,55 +71,93 @@ async function bypassPlatoRelay(url) {
   try {
     console.log(`[PlatoRelay] Launching browser for: ${url}`);
 
+    const chromiumArgs = await chromium.args;
+    const baseArgs = Array.isArray(chromiumArgs) ? chromiumArgs : [];
+
     browser = await puppeteer.launch({
       args: [
-        ...chromium.args,
+        ...baseArgs,
         '--no-sandbox',
         '--disable-setuid-sandbox',
         '--disable-dev-shm-usage',
         '--disable-gpu',
         '--single-process',
         '--no-zygote',
-        '--js-flags=--max-old-space-size=256'
+        '--js-flags=--max-old-space-size=256',
+        '--disable-blink-features=AutomationControlled' // Helps bypass basic bot detection
       ],
-      defaultViewport: chromium.defaultViewport,
+      defaultViewport: { width: 1366, height: 768 },
       executablePath: await chromium.executablePath(),
       headless: true,
     });
 
     const page = await browser.newPage();
 
-    // Block unnecessary resources to speed up execution and save RAM
+    // 1. Set a realistic Desktop Chrome User-Agent
+    await page.setUserAgent(
+      'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36'
+    );
+
+    // 2. Only block heavy media/images (Allow stylesheets/fonts so anti-bot checks don't break)
     await page.setRequestInterception(true);
     page.on('request', (req) => {
       const type = req.resourceType();
-      if (type === 'image' || type === 'font' || type === 'stylesheet' || type === 'media') {
+      if (type === 'image' || type === 'media' || type === 'font') {
         req.abort();
       } else {
         req.continue();
       }
     });
 
-    console.log(`[PlatoRelay] Navigating...`);
+    console.log(`[PlatoRelay] Navigating to URL...`);
 
     await page.goto(url, {
-      waitUntil: 'networkidle2',
-      timeout: 25000
+      waitUntil: 'domcontentloaded',
+      timeout: 30000
     });
 
-    // Wait for any JavaScript redirects or key generation
-    await new Promise(resolve => setTimeout(resolve, 6000));
+    // 3. Check if Cloudflare blocked the Render server IP
+    const pageTitle = await page.title();
+    console.log(`[PlatoRelay] Initial Page Title: "${pageTitle}"`);
+    if (pageTitle.includes('Just a moment') || pageTitle.includes('Attention Required') || pageTitle.includes('Cloudflare')) {
+      await browser.close();
+      throw new Error('Cloudflare blocked Render datacenter IP. This domain requires a residential proxy.');
+    }
+
+    // 4. Wait up to 8 seconds for automatic redirects or verification scripts
+    await new Promise(resolve => setTimeout(resolve, 8000));
+
+    // 5. Auto-click common "Continue" / "Get Key" / "Verify" buttons if present
+    try {
+      await page.evaluate(() => {
+        const buttons = Array.from(document.querySelectorAll('button, a, input[type="submit"]'));
+        for (const btn of buttons) {
+          const txt = btn.textContent.toLowerCase();
+          if (txt.includes('continue') || txt.includes('get key') || txt.includes('verify') || txt.includes('proceed') || txt.includes('submit')) {
+            btn.click();
+            break;
+          }
+        }
+      });
+      // Wait another 5 seconds if a button was clicked
+      await new Promise(resolve => setTimeout(resolve, 5000));
+    } catch (e) {
+      // Ignore click errors
+    }
 
     const finalUrl = page.url();
     const pageContent = await page.content();
-
     console.log(`[PlatoRelay] Final URL: ${finalUrl}`);
 
     const $ = cheerio.load(pageContent);
 
-    // Check URL parameters for key
+    // 6. Print diagnostic snippet to Render logs so we know what is on the page
+    const bodyText = $('body').text().replace(/\s+/g, ' ').trim();
+    console.log(`[PlatoRelay] Page Text Preview: "${bodyText.substring(0, 150)}..."`);
+
+    // Check URL parameters for key (Often PlatoRelay redirects to a ?key=... URL)
     const urlObj = new URL(finalUrl);
-    const keyParam = urlObj.searchParams.get('key') || urlObj.searchParams.get('token');
+    const keyParam = urlObj.searchParams.get('key') || urlObj.searchParams.get('token') || urlObj.searchParams.get('k');
     if (keyParam && keyParam.length > 15) {
       await browser.close();
       return keyParam;
@@ -171,9 +209,8 @@ async function bypassPlatoRelay(url) {
     }
 
     // Last resort: grab any long string from the body
-    const bodyText = $('body').text();
     const potentialKeys = bodyText.match(/[A-Za-z0-9_\-]{20,80}/g) || [];
-    const excludedWords = ['script', 'function', 'window', 'document', 'javascript', 'browser', 'chrome', 'firefox', 'chromium'];
+    const excludedWords = ['script', 'function', 'window', 'document', 'javascript', 'browser', 'chrome', 'firefox', 'chromium', 'cloudflare', 'platorelay'];
 
     for (const key of potentialKeys) {
       if (!excludedWords.some(word => key.toLowerCase().includes(word)) && !key.startsWith('http')) {

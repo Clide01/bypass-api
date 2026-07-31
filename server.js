@@ -65,37 +65,28 @@ async function bypassPlatoboost(url) {
   }
 }
 
-const puppeteer = require('puppeteer');
+const puppeteer = require('puppeteer-core');
+const chromium = require('@sparticuz/chromium');
 
-/**
- * PlatoRelay handler - uses headless browser to execute JS verification
- */
 async function bypassPlatoRelay(url) {
   let browser;
   try {
     console.log(`[PlatoRelay] Launching browser for: ${url}`);
-    
+
     browser = await puppeteer.launch({
-      headless: 'new',
-      args: [
-        '--no-sandbox',
-        '--disable-setuid-sandbox',
-        '--disable-dev-shm-usage',
-        '--disable-gpu',
-        '--single-process'
-      ]
+      args: chromium.args,
+      defaultViewport: chromium.defaultViewport,
+      executablePath: await chromium.executablePath(),
+      headless: chromium.headless,
     });
 
     const page = await browser.newPage();
-    
-    // Set a realistic user agent
-    await page.setUserAgent('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36');
 
     // Block unnecessary resources to speed up
     await page.setRequestInterception(true);
     page.on('request', (req) => {
       const type = req.resourceType();
-      if (type === 'image' || type === 'font' || type === 'stylesheet') {
+      if (type === 'image' || type === 'font' || type === 'stylesheet' || type === 'media') {
         req.abort();
       } else {
         req.continue();
@@ -103,23 +94,23 @@ async function bypassPlatoRelay(url) {
     });
 
     console.log(`[PlatoRelay] Navigating...`);
-    
-    // Navigate to the URL and wait for possible redirects
+
     await page.goto(url, {
       waitUntil: 'networkidle2',
-      timeout: 30000
+      timeout: 25000
     });
 
-    // Wait a bit for any JavaScript execution
-    await new Promise(resolve => setTimeout(resolve, 5000));
+    // Wait for any JavaScript redirects or key generation
+    await new Promise(resolve => setTimeout(resolve, 6000));
 
-    // Get the final URL and page content
     const finalUrl = page.url();
     const pageContent = await page.content();
-    
-    console.log(`[PlatoRelay] Final URL after JS: ${finalUrl}`);
 
-    // Check if we got redirected to a URL with a key
+    console.log(`[PlatoRelay] Final URL: ${finalUrl}`);
+
+    const $ = cheerio.load(pageContent);
+
+    // Check URL parameters for key
     const urlObj = new URL(finalUrl);
     const keyParam = urlObj.searchParams.get('key') || urlObj.searchParams.get('token');
     if (keyParam && keyParam.length > 15) {
@@ -127,10 +118,7 @@ async function bypassPlatoRelay(url) {
       return keyParam;
     }
 
-    // Check the page content for the key
-    const $ = cheerio.load(pageContent);
-    
-    // Look for key in text elements
+    // Check common key elements
     const selectors = [
       'pre', 'code', 'textarea',
       'input[name="key"]', 'input[id*="key"]',
@@ -141,38 +129,31 @@ async function bypassPlatoRelay(url) {
     for (const selector of selectors) {
       const element = $(selector).first();
       let value = element.text().trim() || (element.attr('value') || '');
-      if (value && value.length > 15 && !value.includes('http')) {
+      if (value && value.length > 15 && !value.includes('http') && !value.includes('script')) {
         await browser.close();
         return value;
       }
     }
 
-    // Check if the key is in a <script> tag as a variable
+    // Check for key in JavaScript variables
     const scripts = $('script').toArray();
     for (const script of scripts) {
       const content = $(script).html() || '';
-      const keyMatch = content.match(/['"]([A-Za-z0-9_\-]{25,})['"]/);
-      if (keyMatch && !keyMatch[1].includes('http')) {
-        await browser.close();
-        return keyMatch[1];
+      const keyMatches = content.match(/['"]([A-Za-z0-9_\-]{25,})['"]/g);
+      if (keyMatches) {
+        for (const match of keyMatches) {
+          const clean = match.replace(/['"]/g, '');
+          if (!clean.includes('http') && !clean.includes('script') && !clean.includes('function')) {
+            await browser.close();
+            return clean;
+          }
+        }
       }
     }
 
-    // Check for any long string that looks like a key
-    const bodyText = $('body').text();
-    const potentialKeys = bodyText.match(/[A-Za-z0-9_\-]{20,80}/g) || [];
-    const excludedWords = ['script', 'function', 'window', 'document', 'javascript', 'browser', 'chrome', 'firefox'];
-    
-    for (const key of potentialKeys) {
-      if (!excludedWords.some(word => key.toLowerCase().includes(word)) && !key.startsWith('http')) {
-        await browser.close();
-        return key;
-      }
-    }
-
-    // If we still haven't found it, check if there's a textarea or pre that appeared after JS execution
+    // Extract visible text that looks like a key
     const visibleText = await page.evaluate(() => {
-      const el = document.querySelector('pre, code, textarea, .key, #key, [class*="generated"]');
+      const el = document.querySelector('pre, code, textarea, .key, #key, [class*="generated"], [class*="result"]');
       return el ? el.textContent.trim() : null;
     });
 
@@ -180,6 +161,17 @@ async function bypassPlatoRelay(url) {
 
     if (visibleText && visibleText.length > 15) {
       return visibleText;
+    }
+
+    // Last resort: grab any long string from the body
+    const bodyText = $('body').text();
+    const potentialKeys = bodyText.match(/[A-Za-z0-9_\-]{20,80}/g) || [];
+    const excludedWords = ['script', 'function', 'window', 'document', 'javascript', 'browser', 'chrome', 'firefox', 'chromium'];
+
+    for (const key of potentialKeys) {
+      if (!excludedWords.some(word => key.toLowerCase().includes(word)) && !key.startsWith('http')) {
+        return key;
+      }
     }
 
     return 'Key not found on page';

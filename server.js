@@ -84,21 +84,30 @@ async function bypassPlatoRelay(url) {
         '--single-process',
         '--no-zygote',
         '--js-flags=--max-old-space-size=256',
-        '--disable-blink-features=AutomationControlled' // Helps bypass basic bot detection
+        '--disable-blink-features=AutomationControlled'
       ],
       defaultViewport: { width: 1366, height: 768 },
       executablePath: await chromium.executablePath(),
       headless: true,
     });
 
+    // Automatically close popup ad windows so we stay on the main tab
+    browser.on('targetcreated', async (target) => {
+      if (target.type() === 'page') {
+        const newPage = await target.page();
+        if (newPage && newPage.url() !== url) {
+          console.log(`[PlatoRelay] Blocked & closed popup ad tab: ${newPage.url()}`);
+          await newPage.close().catch(() => {});
+        }
+      }
+    });
+
     const page = await browser.newPage();
 
-    // 1. Set a realistic Desktop Chrome User-Agent
     await page.setUserAgent(
       'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36'
     );
 
-    // 2. Only block heavy media/images (Allow stylesheets/fonts so anti-bot checks don't break)
     await page.setRequestInterception(true);
     page.on('request', (req) => {
       const type = req.resourceType();
@@ -116,71 +125,96 @@ async function bypassPlatoRelay(url) {
       timeout: 30000
     });
 
-    // 3. Check if Cloudflare blocked the Render server IP
     const pageTitle = await page.title();
-    console.log(`[PlatoRelay] Initial Page Title: "${pageTitle}"`);
-    if (pageTitle.includes('Just a moment') || pageTitle.includes('Attention Required') || pageTitle.includes('Cloudflare')) {
+    if (pageTitle.includes('Just a moment') || pageTitle.includes('Attention Required')) {
       await browser.close();
-      throw new Error('Cloudflare blocked Render datacenter IP. This domain requires a residential proxy.');
+      throw new Error('Cloudflare blocked Render datacenter IP.');
     }
 
-    // 4. Wait up to 8 seconds for automatic redirects or verification scripts
-    await new Promise(resolve => setTimeout(resolve, 8000));
+    // =========================================================================
+    // SMART CHECKPOINT POLLING LOOP (Runs for up to 35 seconds)
+    // =========================================================================
+    const maxAttempts = 10;
+    for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+      console.log(`[PlatoRelay] Checkpoint scan attempt ${attempt}/${maxAttempts}...`);
+      await new Promise(resolve => setTimeout(resolve, 3500));
 
-    // 5. Auto-click common "Continue" / "Get Key" / "Verify" buttons if present
-    try {
-      await page.evaluate(() => {
-        const buttons = Array.from(document.querySelectorAll('button, a, input[type="submit"]'));
-        for (const btn of buttons) {
-          const txt = btn.textContent.toLowerCase();
-          if (txt.includes('continue') || txt.includes('get key') || txt.includes('verify') || txt.includes('proceed') || txt.includes('submit')) {
-            btn.click();
-            break;
+      const currentUrl = page.url();
+      const urlObj = new URL(currentUrl);
+      const keyParam = urlObj.searchParams.get('key') || urlObj.searchParams.get('token') || urlObj.searchParams.get('k');
+      
+      // 1. Did we reach a URL with the final key?
+      if (keyParam && keyParam.length > 15) {
+        console.log(`[PlatoRelay] Success! Extracted key from URL param.`);
+        await browser.close();
+        return keyParam;
+      }
+
+      // 2. Is the key already visible in the HTML?
+      const pageContent = await page.content();
+      const $ = cheerio.load(pageContent);
+      
+      const selectors = ['pre', 'code', 'textarea', 'input[name="key"]', '#result', '.result', '.key'];
+      for (const selector of selectors) {
+        const val = $(selector).first().text().trim() || $(selector).first().val();
+        if (val && val.length > 15 && !val.includes('http') && !val.includes('script')) {
+          console.log(`[PlatoRelay] Success! Extracted key from DOM element: ${selector}`);
+          await browser.close();
+          return val;
+        }
+      }
+
+      // 3. Look for and click ANY button/link to advance the checkpoint
+      const clicked = await page.evaluate(() => {
+        // Search buttons, links, divs, and spans that act like buttons
+        const elements = Array.from(document.querySelectorAll('button, a, div[role="button"], span[role="button"], [class*="btn"], [class*="button"]'));
+        
+        for (const el of elements) {
+          const text = (el.innerText || el.textContent || '').toLowerCase().trim();
+          // Avoid clicking "Discord" or "Support" links
+          if (text.includes('discord') || text.includes('support') || text.includes('tutorial')) continue;
+
+          if (
+            text.includes('continue') ||
+            text.includes('get key') ||
+            text.includes('free access') ||
+            text.includes('proceed') ||
+            text.includes('verify') ||
+            text.includes('next')
+          ) {
+            el.scrollIntoView({ behavior: 'smooth', block: 'center' });
+            el.click();
+            return text;
           }
         }
+        return null;
       });
-      // Wait another 5 seconds if a button was clicked
-      await new Promise(resolve => setTimeout(resolve, 5000));
-    } catch (e) {
-      // Ignore click errors
-    }
 
-    const finalUrl = page.url();
-    const pageContent = await page.content();
-    console.log(`[PlatoRelay] Final URL: ${finalUrl}`);
-
-    const $ = cheerio.load(pageContent);
-
-    // 6. Print diagnostic snippet to Render logs so we know what is on the page
-    const bodyText = $('body').text().replace(/\s+/g, ' ').trim();
-    console.log(`[PlatoRelay] Page Text Preview: "${bodyText.substring(0, 150)}..."`);
-
-    // Check URL parameters for key (Often PlatoRelay redirects to a ?key=... URL)
-    const urlObj = new URL(finalUrl);
-    const keyParam = urlObj.searchParams.get('key') || urlObj.searchParams.get('token') || urlObj.searchParams.get('k');
-    if (keyParam && keyParam.length > 15) {
-      await browser.close();
-      return keyParam;
-    }
-
-    // Check common key elements
-    const selectors = [
-      'pre', 'code', 'textarea',
-      'input[name="key"]', 'input[id*="key"]',
-      '[class*="key"]', '[id*="key"]',
-      '.generated', '#generated', '#result', '.result'
-    ];
-
-    for (const selector of selectors) {
-      const element = $(selector).first();
-      let value = element.text().trim() || (element.attr('value') || '');
-      if (value && value.length > 15 && !value.includes('http') && !value.includes('script')) {
-        await browser.close();
-        return value;
+      if (clicked) {
+        console.log(`[PlatoRelay] Clicked checkpoint button: "${clicked}"`);
       }
+
+      // 4. Also check if there is a Cloudflare Turnstile iframe box to click
+      try {
+        const frames = page.frames();
+        for (const frame of frames) {
+          if (frame.url().includes('turnstile') || frame.url().includes('cloudflare')) {
+            const checkbox = await frame.$('input[type="checkbox"], .chk, #challenge-stage');
+            if (checkbox) await checkbox.click();
+          }
+        }
+      } catch (e) {}
     }
 
-    // Check for key in JavaScript variables
+    // =========================================================================
+    // FINAL FALLBACK SCAN
+    // =========================================================================
+    const finalContent = await page.content();
+    const $ = cheerio.load(finalContent);
+    const bodyText = $('body').text().replace(/\s+/g, ' ').trim();
+    console.log(`[PlatoRelay] Final Page Text Preview: "${bodyText.substring(0, 150)}..."`);
+
+    // Check JavaScript variables for key strings
     const scripts = $('script').toArray();
     for (const script of scripts) {
       const content = $(script).html() || '';
@@ -196,28 +230,18 @@ async function bypassPlatoRelay(url) {
       }
     }
 
-    // Extract visible text that looks like a key
-    const visibleText = await page.evaluate(() => {
-      const el = document.querySelector('pre, code, textarea, .key, #key, [class*="generated"], [class*="result"]');
-      return el ? el.textContent.trim() : null;
-    });
-
-    await browser.close();
-
-    if (visibleText && visibleText.length > 15) {
-      return visibleText;
-    }
-
-    // Last resort: grab any long string from the body
+    // Last resort DOM regex scan
     const potentialKeys = bodyText.match(/[A-Za-z0-9_\-]{20,80}/g) || [];
-    const excludedWords = ['script', 'function', 'window', 'document', 'javascript', 'browser', 'chrome', 'firefox', 'chromium', 'cloudflare', 'platorelay'];
+    const excludedWords = ['script', 'function', 'window', 'document', 'javascript', 'browser', 'chrome', 'firefox', 'chromium', 'cloudflare', 'platorelay', 'completed', 'continue'];
 
     for (const key of potentialKeys) {
       if (!excludedWords.some(word => key.toLowerCase().includes(word)) && !key.startsWith('http')) {
+        await browser.close();
         return key;
       }
     }
 
+    await browser.close();
     return 'Key not found on page';
   } catch (err) {
     if (browser) await browser.close().catch(() => {});

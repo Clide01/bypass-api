@@ -65,50 +65,93 @@ async function bypassPlatoboost(url) {
   }
 }
 
-/**
- * Generic bypass handler for other ad-links (Linkvertise, LootLabs, etc.).
- * Attempts to follow redirects and find a key on the final page.
- */
+// --- ENHANCED GENERIC BYPASS ---
 async function bypassGeneric(url) {
   try {
-    // Disable automatic redirects so we can follow them manually
+    // Step 1: First request - follow redirects to get the final page
     let resp = await axios.get(url, {
-      maxRedirects: 0,
+      maxRedirects: 10,
       headers: {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
-        'Accept': 'text/html,application/xhtml+xml',
-        'Referer': url
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36',
+        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
+        'Accept-Language': 'en-US,en;q=0.5',
+        'Referer': url,
+        'Cache-Control': 'no-cache'
       }
     });
 
-    // Follow redirects manually (301, 302, 303, 307, 308)
-    const redirectStatuses = [301, 302, 303, 307, 308];
-    let redirectCount = 0;
-    const maxRedirects = 10;
+    const html = resp.data;
+    const $ = cheerio.load(html);
 
-    while (redirectStatuses.includes(resp.status) && redirectCount < maxRedirects) {
-      const location = resp.headers.location;
-      if (!location) throw new Error('Redirect without location');
-      url = new URL(location, url).href;
-      resp = await axios.get(url, {
-        maxRedirects: 0,
-        headers: { 'User-Agent': 'Mozilla/5.0 ...' }
-      });
-      redirectCount++;
+    // Step 2: Try common key containers first
+    const selectors = [
+      'pre', 'code', 'textarea', 
+      'input[name="key"]', 'input[id*="key"]',
+      'div.key', 'span.key', 'p.key',
+      '.generated-key', '#generated-key',
+      '.bypass-key', '#bypass-key'
+    ];
+
+    for (const selector of selectors) {
+      const element = $(selector).first();
+      let value = element.text().trim() || element.val();
+      if (value && value.length > 10 && !value.includes(' ') && value !== 'undefined') {
+        return value;
+      }
     }
 
-    // Now parse the final page for a key
-    const $ = cheerio.load(resp.data);
+    // Step 3: Look for JavaScript variables containing keys
+    const jsPatterns = [
+      /var\s+key\s*=\s*['"]([^'"]+)['"]/i,
+      /var\s+bypass\s*=\s*['"]([^'"]+)['"]/i,
+      /var\s+result\s*=\s*['"]([^'"]+)['"]/i,
+      /['"]([A-Za-z0-9_\-]{25,})['"]/g,
+      /const\s+\w+\s*=\s*['"]([A-Za-z0-9_\-]{25,})['"]/g
+    ];
 
-    // Common key containers
-    let key = $('pre, code, textarea, input[name="key"]').first().text().trim();
-    if (key && key.length > 10) return key;
+    for (const pattern of jsPatterns) {
+      const matches = html.match(pattern);
+      if (matches) {
+        for (const match of matches) {
+          const clean = match.replace(/^['"]|['"]$/g, '').replace(/^var \w+ = ['"]|^const \w+ = ['"]/i, '');
+          if (clean.length > 15 && !clean.includes('http') && !clean.includes(' ')) {
+            return clean;
+          }
+        }
+      }
+    }
 
-    // Try to extract a long alphanumeric string (typical key format)
+    // Step 4: Look for any long alphanumeric string (likely a key)
     const bodyText = $('body').text();
-    const keyRegex = /[A-Za-z0-9_\-]{20,}/;
-    const match = bodyText.match(keyRegex);
-    return match ? match[0] : 'Key not found on page';
+    const keyRegex = /([A-Za-z0-9_\-]{20,60})/g;
+    const allMatches = bodyText.match(keyRegex);
+    
+    if (allMatches) {
+      // Filter out common false positives
+      const excludedWords = ['script', 'function', 'window', 'document', 'javascript', 'stylesheet', 'analytics', 'google', 'facebook'];
+      for (const match of allMatches) {
+        if (!excludedWords.some(word => match.toLowerCase().includes(word))) {
+          return match;
+        }
+      }
+    }
+
+    // Step 5: Check for iframe or meta redirect
+    const iframeSrc = $('iframe').attr('src');
+    if (iframeSrc && iframeSrc.startsWith('http')) {
+      // Recursively follow the iframe
+      return await bypassGeneric(iframeSrc);
+    }
+
+    const metaRefresh = $('meta[http-equiv="refresh"]').attr('content');
+    if (metaRefresh) {
+      const urlMatch = metaRefresh.match(/url=(.+)/i);
+      if (urlMatch) {
+        return await bypassGeneric(urlMatch[1]);
+      }
+    }
+
+    return 'Key not found on page';
   } catch (err) {
     throw new Error(`Generic bypass failed: ${err.message}`);
   }
